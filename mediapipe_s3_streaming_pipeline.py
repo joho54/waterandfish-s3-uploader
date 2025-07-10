@@ -358,9 +358,18 @@ class S3StreamingUploader:
             'total_files': 0,
             'uploaded_files': 0,
             'failed_files': 0,
+            'skipped_files': 0,
             'total_size': 0,
             'uploaded_size': 0
         }
+    
+    def check_file_exists_simple(self, s3_key: str) -> bool:
+        """S3에 파일이 존재하는지 간단히 확인 (ETag 비교 없이)"""
+        try:
+            self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
+            return True
+        except:
+            return False
     
     def calculate_data_hash(self, data: bytes) -> str:
         """데이터의 MD5 해시 계산"""
@@ -399,6 +408,10 @@ class S3StreamingUploader:
             # 기존 파일 확인
             if not overwrite and self.check_file_exists(s3_key, data_hash):
                 logger.info(f"파일이 이미 존재합니다: {s3_key}")
+                
+                with self.upload_lock:
+                    self.upload_stats['skipped_files'] += 1
+                
                 return {
                     'status': 'skipped',
                     's3_key': s3_key,
@@ -553,7 +566,8 @@ class MediaPipeS3StreamingPipeline:
     def process_video_streaming(self, 
                               video_path: Path,
                               target_fps: int = 30,
-                              max_frames: Optional[int] = None) -> Dict:
+                              max_frames: Optional[int] = None,
+                              skip_existing: bool = True) -> Dict:
         """
         단일 비디오를 스트리밍 처리 (추출 + 업로드)
         
@@ -561,6 +575,7 @@ class MediaPipeS3StreamingPipeline:
             video_path: 비디오 파일 경로
             target_fps: 목표 FPS
             max_frames: 최대 프레임 수
+            skip_existing: 기존 파일 건너뛰기 여부
             
         Returns:
             처리 결과
@@ -585,6 +600,19 @@ class MediaPipeS3StreamingPipeline:
                     'status': 'failed'
                 }
             
+            # S3 키 생성
+            s3_key = f"{self.s3_prefix}/{video_path.stem}_sign_language_landmarks.pkl.gz"
+            
+            # 기존 파일 확인 (조기 건너뛰기)
+            if skip_existing and self.uploader.check_file_exists_simple(s3_key):
+                logger.info(f"이미 처리된 파일입니다: {video_path.name} -> {s3_key}")
+                return {
+                    'video_path': str(video_path),
+                    's3_key': s3_key,
+                    'status': 'skipped',
+                    'reason': 'file_already_exists_in_s3'
+                }
+            
             logger.info(f"처리 시작: {video_path.name} ({file_size / (1024*1024):.2f} MB)")
             
             # 1단계: 메모리에서 시퀀스 추출
@@ -603,10 +631,7 @@ class MediaPipeS3StreamingPipeline:
                     'status': 'failed'
                 }
             
-            # 2단계: S3 키 생성
-            s3_key = f"{self.s3_prefix}/{video_path.stem}_sign_language_landmarks.pkl.gz"
-            
-            # 3단계: S3에 스트리밍 업로드
+            # 2단계: S3에 스트리밍 업로드
             upload_result = self.uploader.upload_data_streaming(
                 compressed_data,
                 s3_key,
@@ -638,6 +663,7 @@ class MediaPipeS3StreamingPipeline:
     def run_streaming_pipeline(self, 
                              target_fps: int = 30,
                              max_frames: Optional[int] = None,
+                             skip_existing: bool = True,
                              video_extensions: List[str] = ['.mp4', '.avi', '.mov', '.mkv']) -> Dict:
         """
         스트리밍 파이프라인 실행
@@ -657,6 +683,7 @@ class MediaPipeS3StreamingPipeline:
         logger.info(f"S3 버킷: {self.s3_bucket}")
         logger.info(f"S3 접두사: {self.s3_prefix}")
         logger.info(f"동시 처리 스레드: {self.max_workers}개")
+        logger.info(f"기존 파일 건너뛰기: {skip_existing}")
         
         # 비디오 파일 찾기
         video_files = []
@@ -715,7 +742,8 @@ class MediaPipeS3StreamingPipeline:
                     self.process_video_streaming,
                     video_file,
                     target_fps,
-                    max_frames
+                    max_frames,
+                    skip_existing
                 )
                 future_to_video[future] = video_file
             
@@ -753,6 +781,7 @@ class MediaPipeS3StreamingPipeline:
         
         self.pipeline_stats['processed_videos'] = len(successful)
         self.pipeline_stats['failed_videos'] = len(failed)
+        self.pipeline_stats['skipped_videos'] = len(skipped)
         self.pipeline_stats['extraction_results'] = results
         self.pipeline_stats['error_analysis'] = error_counts
         
@@ -765,6 +794,12 @@ class MediaPipeS3StreamingPipeline:
         logger.info(f"처리된 비디오: {len(successful)}/{len(valid_video_files)}")
         logger.info(f"실패한 비디오: {len(failed)}개")
         logger.info(f"건너뛴 비디오: {len(skipped)}개")
+        
+        if skipped:
+            logger.info("=== 건너뛴 파일 상세 ===")
+            for result in skipped:
+                reason = result.get('reason', 'unknown')
+                logger.info(f"  {Path(result['video_path']).name}: {reason}")
         
         # 실패 원인 상세 분석
         if error_counts:
@@ -797,6 +832,8 @@ def main():
     parser.add_argument('--max-frames', type=int, help='최대 프레임 수')
     parser.add_argument('--max-workers', type=int, default=4, help='동시 처리 스레드 수')
     parser.add_argument('--model-complexity', type=int, default=1, choices=[0, 1, 2], help='모델 복잡도')
+    parser.add_argument('--skip-existing', action='store_true', default=True, help='S3에 이미 존재하는 파일 건너뛰기')
+    parser.add_argument('--force-overwrite', action='store_true', help='기존 파일 덮어쓰기 (--skip-existing 무시)')
     args = parser.parse_args()
     
     # 스트리밍 파이프라인 초기화
@@ -811,10 +848,14 @@ def main():
         min_tracking_confidence=0.3    # 더 관대한 설정
     )
     
+    # skip_existing 설정 결정
+    skip_existing = args.skip_existing and not args.force_overwrite
+    
     # 스트리밍 파이프라인 실행
     result = pipeline.run_streaming_pipeline(
         target_fps=args.target_fps,
-        max_frames=args.max_frames
+        max_frames=args.max_frames,
+        skip_existing=skip_existing
     )
     
     if result['status'] == 'success':

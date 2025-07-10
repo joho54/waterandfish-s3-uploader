@@ -1,0 +1,30 @@
+# Include README and documentation
+include README.md
+include MEDIAPIPE_S3_PIPELINE_README.md
+include LICENSE
+
+# Include requirements and setup files
+include requirements.txt
+include setup.py
+
+# Include configuration files
+include *.json
+include *.yaml
+include *.yml
+
+# Include Python source files
+recursive-include *.py
+
+# Exclude unnecessary files
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude *.pyd
+global-exclude __pycache__
+global-exclude *.so
+global-exclude .DS_Store
+global-exclude .git*
+global-exclude .vscode
+global-exclude .idea
+global-exclude *.log
+global-exclude *.tmp
+global-exclude *.bak 

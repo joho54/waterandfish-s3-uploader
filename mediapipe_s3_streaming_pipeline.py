@@ -38,8 +38,8 @@ class MediaPipeStreamingExtractor:
                  smooth_landmarks=True,
                  enable_segmentation=False,
                  smooth_segmentation=True,
-                 min_detection_confidence=0.3,  # 더 관대한 설정으로 변경
-                 min_tracking_confidence=0.3):  # 더 관대한 설정으로 변경
+                 min_detection_confidence=0.1,  # 매우 관대한 설정으로 변경
+                 min_tracking_confidence=0.1):  # 매우 관대한 설정으로 변경
         """
         MediaPipe Holistic 초기화 (수어 인식 최적화)
         
@@ -144,6 +144,26 @@ class MediaPipeStreamingExtractor:
                 frame_data['right_hand'] = np.array(right_hand_landmarks)
             else:
                 frame_data['right_hand'] = None
+            
+            # 디버깅 정보 추가 (처음 몇 프레임에만)
+            if hasattr(self, '_debug_frame_count'):
+                self._debug_frame_count += 1
+            else:
+                self._debug_frame_count = 1
+            
+            if self._debug_frame_count <= 5:  # 처음 5프레임만 디버깅
+                detected_parts = []
+                if frame_data['pose'] is not None:
+                    detected_parts.append('pose')
+                if frame_data['left_hand'] is not None:
+                    detected_parts.append('left_hand')
+                if frame_data['right_hand'] is not None:
+                    detected_parts.append('right_hand')
+                
+                if detected_parts:
+                    logger.info(f"프레임 {self._debug_frame_count}: 검출된 부분 - {', '.join(detected_parts)}")
+                else:
+                    logger.warning(f"프레임 {self._debug_frame_count}: 아무것도 검출되지 않음")
             
             # 최소한 포즈나 손 중 하나라도 검출되었으면 반환
             if frame_data['pose'] is not None or frame_data['left_hand'] is not None or frame_data['right_hand'] is not None:
@@ -264,8 +284,14 @@ class MediaPipeStreamingExtractor:
             
             # 성공률이 너무 낮으면 경고 (하지만 계속 진행)
             success_rate = len(landmark_sequences) / (len(landmark_sequences) + failed_frames) if (len(landmark_sequences) + failed_frames) > 0 else 0
-            if success_rate < 0.1:  # 10% 미만이면 경고
+            if success_rate < 0.05:  # 5% 미만이면 경고 (더 관대하게 변경)
                 logger.warning(f"랜드마크 추출 성공률이 낮습니다: {success_rate:.1%} ({len(landmark_sequences)}/{len(landmark_sequences) + failed_frames})")
+            
+            # 최소 1프레임이라도 추출되면 성공으로 처리
+            if len(landmark_sequences) > 0:
+                logger.info(f"랜드마크 추출 성공: {len(landmark_sequences)} 프레임 추출됨 (성공률: {success_rate:.1%})")
+            else:
+                raise ValueError(f"랜드마크가 추출되지 않았습니다. 총 {total_frames} 프레임 중 {failed_frames} 프레임 실패")
             
             # 결과 데이터 구성
             result_data = {

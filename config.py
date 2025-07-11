@@ -1,0 +1,104 @@
+"""
+수어 인식 모델 설정 파일
+모든 파라미터를 통일적으로 관리합니다.
+"""
+
+# 데이터 처리 파라미터
+TARGET_SEQ_LENGTH = 40  # 시퀀스 길이 (프레임 수)
+AUGMENTATIONS_PER_VIDEO = 3  # 비디오당 증강 데이터 수
+
+# 모델 학습 파라미터
+LEARNING_RATE = 0.001  # 0.0001에서 0.001로 증가 (10배 증가)
+BATCH_SIZE = 8
+EPOCHS = 200
+EARLY_STOPPING_PATIENCE = 10
+EARLY_STOPPING_MIN_DELTA = 0.001
+REDUCE_LR_PATIENCE = 3  # 5에서 3으로 단축 (더 빠른 학습률 감소)
+MIN_LR = 1e-5  # 1e-6에서 1e-5로 증가
+
+# 모델 구조 파라미터
+MODEL_LSTM_UNITS_1 = 128
+MODEL_LSTM_UNITS_2 = 64
+MODEL_DENSE_UNITS = 32
+MODEL_DROPOUT_RATE = 0.3
+
+# 과적합 방지 설정
+USE_L2_REGULARIZATION = True
+L2_REGULARIZATION_FACTOR = 0.01
+USE_BATCH_NORMALIZATION = True
+
+# 데이터 분할
+TEST_SIZE = 0.2
+RANDOM_STATE = 42
+
+# 캐시 설정
+CACHE_DIR = "feature-extraction-cache/"
+CHECKPOINT_DIR = "checkpoints"
+MODELS_DIR = "models"
+INFO_DIR = "info"
+
+# MediaPipe 설정
+MEDIAPIPE_STATIC_IMAGE_MODE = False
+MEDIAPIPE_MODEL_COMPLEXITY = 1
+MEDIAPIPE_SMOOTH_LANDMARKS = True
+MEDIAPIPE_ENABLE_SEGMENTATION = False
+MEDIAPIPE_SMOOTH_SEGMENTATION = True
+MEDIAPIPE_MIN_DETECTION_CONFIDENCE = 0.5
+MEDIAPIPE_MIN_TRACKING_CONFIDENCE = 0.5
+
+# 증강 파라미터
+AUGMENTATION_NOISE_LEVEL = 0.05
+AUGMENTATION_SCALE_RANGE = 0.2
+AUGMENTATION_ROTATION_RANGE = 0.1
+
+# None 클래스 증강 파라미터
+NONE_CLASS_NOISE_LEVEL = 0.01
+NONE_CLASS_AUGMENTATIONS_PER_FRAME = 3
+
+# 파일 경로
+IDENTICAL_VIDEO_ROOT = "/Volumes/Sub_Storage/수어 데이터셋/수어 데이터셋"
+
+# 비디오 루트 디렉토리 매핑
+VIDEO_ROOTS = [
+    ((1, 3000), f"{IDENTICAL_VIDEO_ROOT}/0001~3000(영상)"),
+    ((3001, 6000), f"{IDENTICAL_VIDEO_ROOT}/3001~6000(영상)"),
+    ((6001, 8280), f"{IDENTICAL_VIDEO_ROOT}/6001~8280(영상)"),
+    ((8381, 9000), f"{IDENTICAL_VIDEO_ROOT}/8381~9000(영상)"),
+    ((9001, 9600), f"{IDENTICAL_VIDEO_ROOT}/9001~9600(영상)"),
+    ((9601, 10480), f"{IDENTICAL_VIDEO_ROOT}/9601~10480(영상)"),
+    ((10481, 12994), f"{IDENTICAL_VIDEO_ROOT}/10481~12994"),
+    ((12995, 15508), f"{IDENTICAL_VIDEO_ROOT}/12995~15508"),
+    ((15509, 18022), f"{IDENTICAL_VIDEO_ROOT}/15509~18022"),
+    ((18023, 20536), f"{IDENTICAL_VIDEO_ROOT}/18023~20536"),
+    ((20537, 23050), f"{IDENTICAL_VIDEO_ROOT}/20537~23050"),
+    ((23051, 25564), f"{IDENTICAL_VIDEO_ROOT}/23051~25564"),
+    ((25565, 28078), f"{IDENTICAL_VIDEO_ROOT}/25565~28078"),
+    ((28079, 30592), f"{IDENTICAL_VIDEO_ROOT}/28079~30592"),
+    ((30593, 33106), f"{IDENTICAL_VIDEO_ROOT}/30593~33106"),
+    ((33107, 35620), f"{IDENTICAL_VIDEO_ROOT}/33107~35620"),
+    ((36878, 40027), f"{IDENTICAL_VIDEO_ROOT}/36878~40027"),
+    ((40028, 43177), f"{IDENTICAL_VIDEO_ROOT}/40028~43177"),
+]
+
+# 지원하는 비디오 확장자
+VIDEO_EXTENSIONS = [".MOV", ".MTS", ".MP4", ".AVI", ".mov", ".mts", ".mp4", ".avi"]
+
+# 로깅 설정
+LOG_LEVEL = "INFO"
+LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
+LOG_FILE = "training.log"
+
+# 성능 모니터링
+ENABLE_MEMORY_MONITORING = True
+ENABLE_PROGRESS_BAR = True
+BATCH_SIZE_FOR_PROCESSING = 50
+
+# 라벨별 최대 파일 수 제한 (None이면 제한 없음)
+LABEL_MAX_SAMPLES_PER_CLASS = 70  # 예: 10개로 제한, None이면 무제한
+
+# 라벨별 최소 샘플 수 제한 (이 미만이면 학습 중단)
+MIN_SAMPLES_PER_CLASS = 70  # 예: 10개 미만 라벨이 있으면 학습 중단
+
+
+def get_action_index(label, actions):
+    return actions.index(label)

@@ -5,15 +5,19 @@ boto3>=1.28.0
 numpy>=1.21.0
 tqdm>=4.64.0
 
-# Data processing
+# Data processing and analysis
 pandas>=1.5.0
-pickle5>=0.0.11; python_version < "3.8"
+scipy>=1.9.0
+scikit-learn>=1.1.0
 
 # AWS SDK
 botocore>=1.31.0
 
-# Optional: GPU acceleration
-# tensorflow>=2.10.0  # Uncomment if using GPU acceleration
+# Machine Learning (for training pipeline)
+tensorflow>=2.10.0
+
+# Data compression and serialization
+pickle5>=0.0.11; python_version < "3.8"
 
 # Development dependencies (optional)
 # pytest>=6.0

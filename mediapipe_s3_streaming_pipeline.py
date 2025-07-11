@@ -1,894 +1,1079 @@
-#!/usr/bin/env python3
-"""
-미디어파이프 시퀀스 추출 및 S3 스트리밍 업로드 파이프라인
-로컬 저장 없이 메모리에서 직접 S3로 업로드
+""" 훈련 없이 미디어 파이프 시퀸스 추출 후 s3로 스트리밍 업로드
+
+데이터 추출 후 캐시에 저장하고, 캐시에서 데이터를 로드하여 스트리밍 업로드
 """
 
 import os
-import json
-import argparse
-from pathlib import Path
-import logging
-from typing import Dict, List, Optional, Tuple
-import time
-from datetime import datetime
-import io
-import pickle
-import gzip
-import hashlib
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import cv2
 import numpy as np
-import boto3
-from tqdm import tqdm
 import mediapipe as mp
+from tqdm import tqdm
+from sklearn.model_selection import train_test_split
+import tensorflow as tf
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import (
+    LSTM,
+    Dense,
+    Dropout,
+    Input,
+    Bidirectional,
+    Conv1D,
+    MaxPooling1D,
+    GlobalAveragePooling1D,
+    LayerNormalization,
+    MultiHeadAttention,
+    Add,
+    BatchNormalization,
+    Lambda,
+)
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.utils import to_categorical
+from scipy.interpolate import interp1d
+import sys
+import json
+import pandas as pd
+import pickle
+from datetime import datetime
+import logging
+from collections import defaultdict
+from config import LABEL_MAX_SAMPLES_PER_CLASS, MIN_SAMPLES_PER_CLASS
 
-# 로깅 설정
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# MediaPipe 및 TensorFlow 로깅 완전 억제
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # ERROR만 출력
+os.environ["CUDA_VISIBLE_DEVICES"] = ""  # GPU 비활성화 (CPU만 사용)
+logging.getLogger("mediapipe").setLevel(logging.CRITICAL)
+logging.getLogger("tensorflow").setLevel(logging.ERROR)
+logging.getLogger("absl").setLevel(logging.ERROR)
 
-class MediaPipeStreamingExtractor:
-    """수어 인식을 위한 최적화된 랜드마크 추출 클래스 (pose, left_hand, right_hand)"""
-    
-    def __init__(self, 
-                 static_image_mode=False,
-                 model_complexity=1,
-                 smooth_landmarks=True,
-                 enable_segmentation=False,
-                 smooth_segmentation=True,
-                 min_detection_confidence=0.1,  # 매우 관대한 설정으로 변경
-                 min_tracking_confidence=0.1):  # 매우 관대한 설정으로 변경
-        """
-        MediaPipe Holistic 초기화 (수어 인식 최적화)
-        
-        Args:
-            static_image_mode: 정적 이미지 모드
-            model_complexity: 모델 복잡도 (0, 1, 2)
-            smooth_landmarks: 랜드마크 스무딩
-            enable_segmentation: 세그멘테이션 활성화
-            smooth_segmentation: 세그멘테이션 스무딩
-            min_detection_confidence: 최소 검출 신뢰도
-            min_tracking_confidence: 최소 추적 신뢰도
-        """
-        self.mp_holistic = mp.solutions.holistic
-        
-        # MediaPipe 설정에 InputStreamHandler 추가
-        self.holistic = self.mp_holistic.Holistic(
-            static_image_mode=static_image_mode,
-            model_complexity=model_complexity,
-            smooth_landmarks=smooth_landmarks,
-            enable_segmentation=enable_segmentation,
-            smooth_segmentation=smooth_segmentation,
-            min_detection_confidence=min_detection_confidence,
-            min_tracking_confidence=min_tracking_confidence
-        )
-        
-        # 타임스탬프 문제 해결을 위한 설정
-        mp.solutions.drawing_utils.DrawingSpec = mp.solutions.drawing_utils.DrawingSpec
-        
-        # 수어 인식을 위한 핵심 랜드마크 인덱스 정의
-        self.pose_landmark_indices = {
-            'nose': 0,
-            'left_eye': 2,
-            'right_eye': 5,
-            'left_ear': 7,
-            'right_ear': 8,
-            'left_shoulder': 11,
-            'right_shoulder': 12,
-            'left_elbow': 13,
-            'right_elbow': 14,
-            'left_wrist': 15,
-            'right_wrist': 16,
-            'left_hip': 23,
-            'right_hip': 24,
-            'left_knee': 25,
-            'right_knee': 26,
-            'left_ankle': 27,
-            'right_ankle': 28
-        }
-        
-        # 손 랜드마크는 21개씩 (MediaPipe Hand의 기본)
-        self.hand_landmark_indices = {
-            'wrist': 0,
-            'thumb_tip': 4,
-            'index_tip': 8,
-            'middle_tip': 12,
-            'ring_tip': 16,
-            'pinky_tip': 20
-        }
-    
-    def extract_landmarks(self, frame: np.ndarray) -> Optional[Dict]:
-        """
-        프레임에서 수어 인식을 위한 랜드마크 추출 (pose, left_hand, right_hand)
-        
-        Args:
-            frame: 입력 프레임 (BGR)
-            
-        Returns:
-            랜드마크 딕셔너리 또는 None
-        """
-        try:
-            # BGR을 RGB로 변환
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Holistic 검출
-            results = self.holistic.process(rgb_frame)
-            
-            frame_data = {}
-            
-            # 포즈 랜드마크 추출
-            if results.pose_landmarks:
-                pose_landmarks = []
-                for landmark in results.pose_landmarks.landmark:
-                    pose_landmarks.append([landmark.x, landmark.y, landmark.visibility])
-                frame_data['pose'] = np.array(pose_landmarks)
-            else:
-                frame_data['pose'] = None
-            
-            # 왼손 랜드마크 추출
-            if results.left_hand_landmarks:
-                left_hand_landmarks = []
-                for landmark in results.left_hand_landmarks.landmark:
-                    left_hand_landmarks.append([landmark.x, landmark.y, landmark.z])
-                frame_data['left_hand'] = np.array(left_hand_landmarks)
-            else:
-                frame_data['left_hand'] = None
-            
-            # 오른손 랜드마크 추출
-            if results.right_hand_landmarks:
-                right_hand_landmarks = []
-                for landmark in results.right_hand_landmarks.landmark:
-                    right_hand_landmarks.append([landmark.x, landmark.y, landmark.z])
-                frame_data['right_hand'] = np.array(right_hand_landmarks)
-            else:
-                frame_data['right_hand'] = None
-            
-            # 디버깅 정보 추가 (처음 몇 프레임에만)
-            if hasattr(self, '_debug_frame_count'):
-                self._debug_frame_count += 1
-            else:
-                self._debug_frame_count = 1
-            
-            if self._debug_frame_count <= 5:  # 처음 5프레임만 디버깅
-                detected_parts = []
-                if frame_data['pose'] is not None:
-                    detected_parts.append('pose')
-                if frame_data['left_hand'] is not None:
-                    detected_parts.append('left_hand')
-                if frame_data['right_hand'] is not None:
-                    detected_parts.append('right_hand')
-                
-                if detected_parts:
-                    logger.info(f"프레임 {self._debug_frame_count}: 검출된 부분 - {', '.join(detected_parts)}")
-                else:
-                    logger.warning(f"프레임 {self._debug_frame_count}: 아무것도 검출되지 않음")
-            
-            # 최소한 포즈나 손 중 하나라도 검출되었으면 반환
-            if frame_data['pose'] is not None or frame_data['left_hand'] is not None or frame_data['right_hand'] is not None:
-                return frame_data
-            
-            return None
-            
-        except Exception as e:
-            # MediaPipe 타임스탬프 오류 등은 무시하고 계속 진행
-            if "timestamp mismatch" in str(e).lower() or "graph has errors" in str(e).lower():
-                return None
-            else:
-                # 다른 오류는 로깅
-                logger.warning(f"랜드마크 추출 중 오류: {e}")
-                return None
-    
-    def extract_sequence_to_memory(self, 
-                                 video_path: str,
-                                 target_fps: int = 30,
-                                 max_frames: Optional[int] = None) -> Tuple[bytes, Dict]:
-        """
-        비디오에서 수어 인식을 위한 랜드마크 시퀀스를 메모리에 추출
-        
-        Args:
-            video_path: 입력 비디오 경로
-            target_fps: 목표 FPS (다운샘플링)
-            max_frames: 최대 프레임 수
-            
-        Returns:
-            (압축된 시퀀스 데이터, 메타데이터)
-        """
-        cap = cv2.VideoCapture(video_path)
-        
-        if not cap.isOpened():
-            raise ValueError(f"비디오를 열 수 없습니다: {video_path}")
-        
-        try:
-            # 비디오 정보
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            original_fps = cap.get(cv2.CAP_PROP_FPS)
-            
-            # 비디오 정보 유효성 검사
-            if total_frames <= 0:
-                raise ValueError(f"유효하지 않은 프레임 수: {total_frames}")
-            if original_fps <= 0:
-                raise ValueError(f"유효하지 않은 FPS: {original_fps}")
-            
-            duration = total_frames / original_fps
-            
-            logger.info(f"비디오 정보: {total_frames} 프레임, {original_fps:.2f} FPS, {duration:.2f}초")
-            
-            # 프레임 간격 계산
-            frame_interval = max(1, int(original_fps / target_fps))
-            
-            # 시퀀스 저장용 리스트
-            landmark_sequences = []
-            frame_timestamps = []
-            extracted_frames = 0
-            
-            # 통계 추적
-            pose_detected = 0
-            left_hand_detected = 0
-            right_hand_detected = 0
-            failed_frames = 0
-            
-            # 진행률 표시
-            pbar = tqdm(total=min(total_frames, max_frames) if max_frames else total_frames,
-                       desc=f"수어 랜드마크 추출 중: {Path(video_path).name}")
-            
-            frame_idx = 0
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                
-                # 프레임 간격에 따라 추출
-                if frame_idx % frame_interval == 0:
+# 설정 파일에서 파라미터 import
+from config import *
+
+# MediaPipe 초기화
+mp_holistic = mp.solutions.holistic
+
+
+class MediaPipeManager:
+    """MediaPipe 객체를 안전하게 관리하는 컨텍스트 매니저"""
+
+    _instance = None
+    _holistic = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(MediaPipeManager, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if self._holistic is None:
+            self._holistic = mp_holistic.Holistic(
+                static_image_mode=MEDIAPIPE_STATIC_IMAGE_MODE,
+                model_complexity=MEDIAPIPE_MODEL_COMPLEXITY,
+                smooth_landmarks=MEDIAPIPE_SMOOTH_LANDMARKS,
+                enable_segmentation=MEDIAPIPE_ENABLE_SEGMENTATION,
+                smooth_segmentation=MEDIAPIPE_SMOOTH_SEGMENTATION,
+                min_detection_confidence=MEDIAPIPE_MIN_DETECTION_CONFIDENCE,
+                min_tracking_confidence=MEDIAPIPE_MIN_TRACKING_CONFIDENCE,
+            )
+
+    def __enter__(self):
+        return self._holistic
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # 전역 객체는 유지하고 정리만
+        pass
+
+    @classmethod
+    def cleanup(cls):
+        """전역 MediaPipe 객체 정리"""
+        if cls._holistic:
+            cls._holistic.close()
+            cls._holistic = None
+
+
+# 라벨별 캐시 파일 경로 생성 함수
+def get_label_cache_path(label):
+    """라벨별 캐시 파일 경로를 반환합니다. 주요 파라미터를 파일명에 포함시켜 캐시 무효화가 자동으로 되도록 합니다."""
+    safe_label = label.replace(" ", "_").replace("/", "_")
+
+    # 데이터 개수 관련 파라미터들을 파일명에 포함
+    max_samples_str = (
+        f"max{LABEL_MAX_SAMPLES_PER_CLASS}"
+        if LABEL_MAX_SAMPLES_PER_CLASS
+        else "maxNone"
+    )
+    min_samples_str = f"min{MIN_SAMPLES_PER_CLASS}"
+
+    return os.path.join(
+        CACHE_DIR,
+        f"{safe_label}_seq{TARGET_SEQ_LENGTH}_aug{AUGMENTATIONS_PER_VIDEO}_{max_samples_str}_{min_samples_str}.pkl",
+    )
+
+
+def save_label_cache(label, data):
+    """라벨별 데이터를 캐시에 저장합니다."""
+    cache_path = get_label_cache_path(label)
+
+    # 캐시에 저장할 데이터와 파라미터 정보
+    cache_data = {
+        "data": data,
+        "parameters": {
+            "TARGET_SEQ_LENGTH": TARGET_SEQ_LENGTH,
+            "AUGMENTATIONS_PER_VIDEO": AUGMENTATIONS_PER_VIDEO,
+            "AUGMENTATION_NOISE_LEVEL": AUGMENTATION_NOISE_LEVEL,
+            "AUGMENTATION_SCALE_RANGE": AUGMENTATION_SCALE_RANGE,
+            "AUGMENTATION_ROTATION_RANGE": AUGMENTATION_ROTATION_RANGE,
+            "NONE_CLASS_NOISE_LEVEL": NONE_CLASS_NOISE_LEVEL,
+            "NONE_CLASS_AUGMENTATIONS_PER_FRAME": NONE_CLASS_AUGMENTATIONS_PER_FRAME,
+            # 데이터 개수 관련 파라미터 추가
+            "LABEL_MAX_SAMPLES_PER_CLASS": LABEL_MAX_SAMPLES_PER_CLASS,
+            "MIN_SAMPLES_PER_CLASS": MIN_SAMPLES_PER_CLASS,
+        },
+    }
+
+    # 임시 파일에 먼저 저장 (원자적 쓰기)
+    temp_path = cache_path + ".tmp"
+
+    try:
+        with open(temp_path, "wb") as f:
+            pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+        # 성공적으로 저장되면 최종 위치로 이동
+        os.replace(temp_path, cache_path)
+        print(f"💾 {label} 라벨 데이터 캐시 저장: {cache_path} ({len(data)}개 샘플)")
+
+    except Exception as e:
+        # 오류 발생 시 임시 파일 정리
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        raise e
+
+
+
+def process_data_in_batches(file_mapping, batch_size=100):
+    """메모리 효율성을 위해 데이터를 배치 단위로 처리합니다."""
+    all_files = list(file_mapping.items())
+    total_files = len(all_files)
+
+    print(f"📊 총 {total_files}개 파일을 {batch_size}개씩 배치 처리합니다.")
+
+    # 진행률 표시 설정에 따라 tqdm 사용
+    if ENABLE_PROGRESS_BAR:
+        iterator = tqdm(range(0, total_files, batch_size), desc="배치 처리")
+    else:
+        iterator = range(0, total_files, batch_size)
+
+    # MediaPipe 객체 재사용
+    try:
+        with MediaPipeManager() as holistic:
+            print("✅ MediaPipe 객체 초기화 완료")
+
+            for i in iterator:
+                batch_files = all_files[i : i + batch_size]
+                batch_data = []
+
+                print(
+                    f"🔄 배치 {i//batch_size + 1} 처리 중... ({len(batch_files)}개 파일)"
+                )
+
+                for filename, info in batch_files:
                     try:
-                        landmarks = self.extract_landmarks(frame)
-                        
-                        if landmarks is not None:
-                            landmark_sequences.append(landmarks)
-                            frame_timestamps.append(frame_idx / original_fps)
-                            extracted_frames += 1
-                            
-                            # 통계 업데이트
-                            if landmarks['pose'] is not None:
-                                pose_detected += 1
-                            if landmarks['left_hand'] is not None:
-                                left_hand_detected += 1
-                            if landmarks['right_hand'] is not None:
-                                right_hand_detected += 1
-                        else:
-                            failed_frames += 1
-                        
+                        print(f"  📹 {filename} 처리 중...")
+                        landmarks = extract_landmarks_with_holistic(
+                            info["path"], holistic
+                        )
+                        if not landmarks:
+                            print(f"    ⚠️ 랜드마크 추출 실패: {filename}")
+                            continue
+
+                        processed_sequence = enhanced_preprocess_landmarks(landmarks)
+                        if processed_sequence.shape != (TARGET_SEQ_LENGTH, 675):
+                            print(
+                                f"    ⚠️ 시퀀스 형태 불일치: {filename} - {processed_sequence.shape}"
+                            )
+                            continue
+
+                        batch_data.append(
+                            {
+                                "sequence": processed_sequence,
+                                "label": info["label"],
+                                "filename": filename,
+                            }
+                        )
+                        print(f"    ✅ 성공: {filename}")
+
                     except Exception as e:
-                        error_msg = str(e).lower()
-                        # MediaPipe 타임스탬프 오류는 무시
-                        if "timestamp mismatch" in error_msg or "graph has errors" in error_msg:
-                            failed_frames += 1
-                        else:
-                            logger.warning(f"프레임 {frame_idx} 처리 실패: {e}")
-                            failed_frames += 1
-                    
-                    pbar.update(1)
-                    
-                    # 최대 프레임 수 체크
-                    if max_frames and extracted_frames >= max_frames:
-                        break
-                
-                frame_idx += 1
-            
-            pbar.close()
-            
-            # 최소한의 랜드마크가 추출되었는지 확인
-            if len(landmark_sequences) == 0:
-                raise ValueError(f"랜드마크가 추출되지 않았습니다. 총 {total_frames} 프레임 중 {failed_frames} 프레임 실패")
-            
-            # 성공률이 너무 낮으면 경고 (하지만 계속 진행)
-            success_rate = len(landmark_sequences) / (len(landmark_sequences) + failed_frames) if (len(landmark_sequences) + failed_frames) > 0 else 0
-            if success_rate < 0.05:  # 5% 미만이면 경고 (더 관대하게 변경)
-                logger.warning(f"랜드마크 추출 성공률이 낮습니다: {success_rate:.1%} ({len(landmark_sequences)}/{len(landmark_sequences) + failed_frames})")
-            
-            # 최소 1프레임이라도 추출되면 성공으로 처리
-            if len(landmark_sequences) > 0:
-                logger.info(f"랜드마크 추출 성공: {len(landmark_sequences)} 프레임 추출됨 (성공률: {success_rate:.1%})")
-            else:
-                raise ValueError(f"랜드마크가 추출되지 않았습니다. 총 {total_frames} 프레임 중 {failed_frames} 프레임 실패")
-            
-            # 결과 데이터 구성
-            result_data = {
-                'video_path': video_path,
-                'landmark_sequences': landmark_sequences,
-                'frame_timestamps': np.array(frame_timestamps),
-                'metadata': {
-                    'total_frames': total_frames,
-                    'extracted_frames': len(landmark_sequences),
-                    'original_fps': original_fps,
-                    'target_fps': target_fps,
-                    'frame_interval': frame_interval,
-                    'duration': duration,
-                    'pose_landmark_count': 33,
-                    'hand_landmark_count': 21,
-                    'pose_landmark_indices': self.pose_landmark_indices,
-                    'hand_landmark_indices': self.hand_landmark_indices,
-                    'detection_stats': {
-                        'pose_detected': pose_detected,
-                        'left_hand_detected': left_hand_detected,
-                        'right_hand_detected': right_hand_detected,
-                        'pose_detection_rate': pose_detected / len(landmark_sequences) if landmark_sequences else 0,
-                        'left_hand_detection_rate': left_hand_detected / len(landmark_sequences) if landmark_sequences else 0,
-                        'right_hand_detection_rate': right_hand_detected / len(landmark_sequences) if landmark_sequences else 0,
-                        'failed_frames': failed_frames
-                    }
-                }
-            }
-            
-            # 메모리에서 압축
-            buffer = io.BytesIO()
-            with gzip.GzipFile(fileobj=buffer, mode='wb') as f:
-                pickle.dump(result_data, f)
-            
-            compressed_data = buffer.getvalue()
-            
-            logger.info(f"수어 랜드마크 시퀀스 추출 완료: {len(landmark_sequences)} 프레임 -> {len(compressed_data) / (1024*1024):.2f} MB")
-            logger.info(f"검출 통계 - 포즈: {pose_detected}, 왼손: {left_hand_detected}, 오른손: {right_hand_detected}, 실패: {failed_frames}")
-            
-            return compressed_data, {
-                'video_path': video_path,
-                'extracted_frames': len(landmark_sequences),
-                'total_frames': total_frames,
-                'compression_ratio': len(landmark_sequences) / total_frames,
-                'file_size_mb': len(compressed_data) / (1024 * 1024),
-                'detection_stats': {
-                    'pose_detected': pose_detected,
-                    'left_hand_detected': left_hand_detected,
-                    'right_hand_detected': right_hand_detected,
-                    'failed_frames': failed_frames
-                }
-            }
-            
-        finally:
-            cap.release()
-    
-    def __del__(self):
-        """리소스 정리"""
-        if hasattr(self, 'holistic'):
-            self.holistic.close()
+                        print(f"    ❌ 오류: {filename} - {e}")
+                        continue
 
-class S3StreamingUploader:
-    """메모리에서 직접 S3로 스트리밍 업로드하는 클래스"""
-    
-    def __init__(self, 
-                 bucket_name: str,
-                 region_name: str = 'us-east-1',
-                 max_workers: int = 4,
-                 chunk_size: int = 8 * 1024 * 1024):  # 8MB 청크
-        """
-        S3 스트리밍 업로더 초기화
-        
-        Args:
-            bucket_name: S3 버킷 이름
-            region_name: AWS 리전
-            max_workers: 동시 업로드 스레드 수
-            chunk_size: 멀티파트 업로드 청크 크기
-        """
-        self.bucket_name = bucket_name
-        self.region_name = region_name
-        self.max_workers = max_workers
-        self.chunk_size = chunk_size
-        
-        # S3 클라이언트 초기화
-        self.s3_client = boto3.client('s3', region_name=region_name)
-        
-        # 업로드 진행률 추적
-        self.upload_lock = threading.Lock()
-        self.upload_stats = {
-            'total_files': 0,
-            'uploaded_files': 0,
-            'failed_files': 0,
-            'skipped_files': 0,
-            'total_size': 0,
-            'uploaded_size': 0
-        }
-    
-    def check_file_exists_simple(self, s3_key: str) -> bool:
-        """S3에 파일이 존재하는지 간단히 확인 (ETag 비교 없이)"""
-        try:
-            self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
-            return True
-        except:
-            return False
-    
-    def calculate_data_hash(self, data: bytes) -> str:
-        """데이터의 MD5 해시 계산"""
-        return hashlib.md5(data).hexdigest()
-    
-    def check_file_exists(self, s3_key: str, data_hash: str) -> bool:
-        """S3에 파일이 존재하는지 확인 (해시 비교)"""
-        try:
-            response = self.s3_client.head_object(Bucket=self.bucket_name, Key=s3_key)
-            etag = response.get('ETag', '').strip('"')
-            return etag == data_hash
-        except:
-            return False
-    
-    def upload_data_streaming(self, 
-                            data: bytes, 
-                            s3_key: str,
-                            overwrite: bool = False) -> Dict:
-        """
-        메모리 데이터를 S3에 스트리밍 업로드
-        
-        Args:
-            data: 업로드할 데이터 (bytes)
-            s3_key: S3 키
-            overwrite: 기존 파일 덮어쓰기 여부
-            
-        Returns:
-            업로드 결과
-        """
-        try:
-            data_size = len(data)
-            
-            # 데이터 해시 계산
-            data_hash = self.calculate_data_hash(data)
-            
-            # 기존 파일 확인
-            if not overwrite and self.check_file_exists(s3_key, data_hash):
-                logger.info(f"파일이 이미 존재합니다: {s3_key}")
-                
-                with self.upload_lock:
-                    self.upload_stats['skipped_files'] += 1
-                
-                return {
-                    'status': 'skipped',
-                    's3_key': s3_key,
-                    'file_size': data_size,
-                    'reason': 'file_already_exists'
-                }
-            
-            # 업로드 실행
-            start_time = time.time()
-            
-            if data_size > self.chunk_size:
-                # 멀티파트 업로드
-                result = self._multipart_upload_data(data, s3_key, data_size)
-            else:
-                # 단일 업로드
-                self.s3_client.put_object(
-                    Bucket=self.bucket_name,
-                    Key=s3_key,
-                    Body=data
-                )
-                result = {'status': 'success'}
-            
-            upload_time = time.time() - start_time
-            speed = data_size / upload_time if upload_time > 0 else 0
-            
-            # 통계 업데이트
-            with self.upload_lock:
-                self.upload_stats['uploaded_files'] += 1
-                self.upload_stats['uploaded_size'] += data_size
-            
-            return {
-                'status': 'success',
-                's3_key': s3_key,
-                'file_size': data_size,
-                'upload_time': upload_time,
-                'speed_mbps': speed / (1024 * 1024)
-            }
-            
-        except Exception as e:
-            logger.error(f"업로드 실패 {s3_key}: {e}")
-            
-            with self.upload_lock:
-                self.upload_stats['failed_files'] += 1
-            
-            return {
-                'status': 'failed',
-                's3_key': s3_key,
-                'error': str(e)
-            }
-    
-    def _multipart_upload_data(self, data: bytes, s3_key: str, data_size: int) -> Dict:
-        """메모리 데이터 멀티파트 업로드"""
-        try:
-            # 멀티파트 업로드 시작
-            response = self.s3_client.create_multipart_upload(
-                Bucket=self.bucket_name,
-                Key=s3_key
-            )
-            upload_id = response['UploadId']
-            
-            parts = []
-            part_number = 1
-            
-            # 데이터를 청크로 분할
-            for i in range(0, data_size, self.chunk_size):
-                chunk = data[i:i + self.chunk_size]
-                
-                # 파트 업로드
-                part_response = self.s3_client.upload_part(
-                    Bucket=self.bucket_name,
-                    Key=s3_key,
-                    PartNumber=part_number,
-                    UploadId=upload_id,
-                    Body=chunk
-                )
-                
-                parts.append({
-                    'ETag': part_response['ETag'],
-                    'PartNumber': part_number
-                })
-                
-                part_number += 1
-            
-            # 멀티파트 업로드 완료
-            self.s3_client.complete_multipart_upload(
-                Bucket=self.bucket_name,
-                Key=s3_key,
-                UploadId=upload_id,
-                MultipartUpload={'Parts': parts}
-            )
-            
-            return {'status': 'success'}
-            
-        except Exception as e:
-            # 업로드 실패 시 정리
-            try:
-                self.s3_client.abort_multipart_upload(
-                    Bucket=self.bucket_name,
-                    Key=s3_key,
-                    UploadId=upload_id
-                )
-            except:
-                pass
-            raise e
+                print(f"✅ 배치 {i//batch_size + 1} 완료: {len(batch_data)}개 성공")
+                yield batch_data
 
-class MediaPipeS3StreamingPipeline:
-    """미디어파이프 시퀀스 추출 및 S3 스트리밍 업로드 통합 파이프라인"""
-    
-    def __init__(self, 
-                 video_dir: str,
-                 s3_bucket: str,
-                 s3_prefix: str,
-                 aws_region: str = 'us-east-1',
-                 max_workers: int = 4,
-                 **extractor_kwargs):
-        """
-        스트리밍 파이프라인 초기화
-        
-        Args:
-            video_dir: 비디오 디렉토리
-            s3_bucket: S3 버킷 이름
-            s3_prefix: S3 접두사
-            aws_region: AWS 리전
-            max_workers: 동시 처리 스레드 수
-            **extractor_kwargs: 추출기 설정
-        """
-        self.video_dir = Path(video_dir)
-        self.s3_bucket = s3_bucket
-        self.s3_prefix = s3_prefix
-        self.aws_region = aws_region
-        self.max_workers = max_workers
-        
-        # 컴포넌트 초기화
-        self.extractor = MediaPipeStreamingExtractor(**extractor_kwargs)
-        self.uploader = S3StreamingUploader(
-            bucket_name=s3_bucket,
-            region_name=aws_region,
-            max_workers=max_workers
+    except Exception as e:
+        print(f"❌ MediaPipe 처리 중 오류: {e}")
+        yield []
+
+
+def extract_and_cache_label_data_optimized(file_mapping, label):
+    """메모리 효율적인 라벨별 데이터 추출 및 캐싱"""
+    print(f"\n🔄 {label} 라벨 데이터 추출 중...")
+
+    # 해당 라벨의 파일들만 필터링
+    label_files = {
+        filename: info
+        for filename, info in file_mapping.items()
+        if info["label"] == label
+    }
+
+    if not label_files:
+        print(f"⚠️ {label} 라벨에 해당하는 파일이 없습니다.")
+        return []
+
+    label_data = []
+
+    # 배치 단위로 처리
+    for batch in process_data_in_batches(
+        label_files, batch_size=BATCH_SIZE_FOR_PROCESSING
+    ):
+        for item in batch:
+            if item["label"] == label:
+                # 원본 데이터 추가
+                label_data.append(item["sequence"])
+
+                # 증강 데이터 추가
+                for _ in range(AUGMENTATIONS_PER_VIDEO):
+                    try:
+                        augmented = augment_sequence_improved(item["sequence"])
+                        if augmented.shape == (TARGET_SEQ_LENGTH, 675):
+                            label_data.append(augmented)
+                    except Exception as e:
+                        print(f"⚠️ 증강 중 오류: {e}")
+                        continue
+
+    print(f"✅ {label} 라벨 데이터 추출 완료: {len(label_data)}개 샘플")
+
+    # 캐시에 저장
+    save_label_cache(label, label_data)
+
+    return label_data
+
+
+def generate_balanced_none_class_data(file_mapping, none_class, target_count=None):
+    """다른 클래스와 균형있는 None 클래스 데이터를 생성하고 캐시에 저장합니다."""
+    print(f"\n✨ '{none_class}' 클래스 데이터 생성 중...")
+
+    # 목표 개수 계산 (다른 클래스의 평균 개수)
+    if target_count is None:
+        # 다른 클래스들의 원본 파일 개수 계산
+        other_class_counts = []
+        for filename, info in file_mapping.items():
+            if info["label"] != none_class:
+                other_class_counts.append(info["label"])
+
+        # 라벨별 개수 집계
+        from collections import Counter
+
+        label_counts = Counter(other_class_counts)
+
+        if label_counts:
+            # 다른 클래스들의 평균 개수 계산 (증강 후 예상 개수)
+            avg_original_count = sum(label_counts.values()) / len(label_counts)
+            target_count = int(avg_original_count * (1 + AUGMENTATIONS_PER_VIDEO))
+            print(
+                f"📊 다른 클래스 평균: {avg_original_count:.1f}개 → 목표 None 클래스: {target_count}개"
+            )
+        else:
+            target_count = 100  # 기본값
+            print(f"📊 기본 목표 None 클래스: {target_count}개")
+
+    none_samples = []
+    source_videos = list(file_mapping.keys())
+
+    # 목표 개수에 도달할 때까지 반복
+    video_index = 0
+    while len(none_samples) < target_count and video_index < len(source_videos):
+        filename = source_videos[video_index % len(source_videos)]  # 순환 사용
+        file_path = file_mapping[filename]["path"]
+
+        try:
+            # MediaPipe 객체 재사용 (한 번에 하나씩 처리)
+            with MediaPipeManager() as holistic:
+                landmarks = extract_landmarks_with_holistic(file_path, holistic)
+
+                if landmarks and len(landmarks) > 10:
+                    # 영상의 시작, 1/4, 1/2, 3/4, 끝 지점에서 프레임 추출
+                    frame_indices = [
+                        0,
+                        len(landmarks) // 4,
+                        len(landmarks) // 2,
+                        3 * len(landmarks) // 4,
+                        -1,
+                    ]
+
+                    for idx in frame_indices:
+                        if len(none_samples) >= target_count:
+                            break
+
+                        static_landmarks = [landmarks[idx]] * TARGET_SEQ_LENGTH
+                        static_sequence = enhanced_preprocess_landmarks(
+                            static_landmarks
+                        )
+
+                        if static_sequence.shape != (TARGET_SEQ_LENGTH, 675):
+                            continue
+
+                        # 정적 시퀀스 추가
+                        none_samples.append(static_sequence)
+
+                        # 미세한 움직임 추가 (노이즈) - 목표 개수 제한
+                        for _ in range(
+                            min(
+                                NONE_CLASS_AUGMENTATIONS_PER_FRAME,
+                                target_count - len(none_samples),
+                            )
+                        ):
+                            if len(none_samples) >= target_count:
+                                break
+                            augmented = augment_sequence_improved(
+                                static_sequence, noise_level=NONE_CLASS_NOISE_LEVEL
+                            )
+                            if augmented.shape == (TARGET_SEQ_LENGTH, 675):
+                                none_samples.append(augmented)
+
+                    # 느린 전환 데이터 생성 (목표 개수 제한)
+                    if len(none_samples) < target_count:
+                        start_frame_lm = landmarks[0]
+                        middle_frame_lm = landmarks[len(landmarks) // 2]
+
+                        transition_landmarks = []
+                        for i in range(TARGET_SEQ_LENGTH):
+                            alpha = i / (TARGET_SEQ_LENGTH - 1)
+                            interp_frame = {}
+                            for key in ["pose", "left_hand", "right_hand"]:
+                                if start_frame_lm.get(key) and middle_frame_lm.get(key):
+                                    interp_lm = []
+                                    start_lms = start_frame_lm[key].landmark
+                                    mid_lms = middle_frame_lm[key].landmark
+                                    for j in range(len(start_lms)):
+                                        new_x = (
+                                            start_lms[j].x * (1 - alpha)
+                                            + mid_lms[j].x * alpha
+                                        )
+                                        new_y = (
+                                            start_lms[j].y * (1 - alpha)
+                                            + mid_lms[j].y * alpha
+                                        )
+                                        new_z = (
+                                            start_lms[j].z * (1 - alpha)
+                                            + mid_lms[j].z * alpha
+                                        )
+                                        interp_lm.append(
+                                            type(
+                                                "obj",
+                                                (object,),
+                                                {"x": new_x, "y": new_y, "z": new_z},
+                                            )
+                                        )
+                                    interp_frame[key] = type(
+                                        "obj", (object,), {"landmark": interp_lm}
+                                    )
+                                else:
+                                    interp_frame[key] = None
+                            transition_landmarks.append(interp_frame)
+
+                        transition_sequence = enhanced_preprocess_landmarks(
+                            transition_landmarks
+                        )
+                        if transition_sequence.shape == (TARGET_SEQ_LENGTH, 675):
+                            none_samples.append(transition_sequence)
+
+        except Exception as e:
+            print(f"⚠️ None 클래스 데이터 생성 중 오류: {filename}, 오류: {e}")
+
+        video_index += 1
+
+    print(
+        f"✅ {none_class} 클래스 데이터 생성 완료: {len(none_samples)}개 샘플 (목표: {target_count}개)"
+    )
+
+    return none_samples
+
+
+def validate_video_roots():
+    """VIDEO_ROOTS의 모든 디렉토리가 존재하는지 확인합니다."""
+    print("🔍 비디오 루트 디렉토리 검증 중...")
+    valid_roots = []
+
+    for (range_start, range_end), root_path in VIDEO_ROOTS:
+        if os.path.exists(root_path):
+            valid_roots.append(((range_start, range_end), root_path))
+            print(f"✅ {range_start}~{range_end}: {root_path}")
+        else:
+            print(f"❌ {range_start}~{range_end}: {root_path} (존재하지 않음)")
+
+    return valid_roots
+
+
+def find_file_in_directory(directory, filename_pattern):
+    """디렉토리에서 파일 패턴에 맞는 파일을 찾습니다."""
+    if not os.path.exists(directory):
+        return None
+
+    # 파일명에서 확장자 제거
+    base_name = filename_pattern.split(".")[0]
+
+    # 가능한 확장자들 (config에서 가져옴)
+    for ext in VIDEO_EXTENSIONS:
+        candidate = os.path.join(directory, base_name + ext)
+        if os.path.exists(candidate):
+            return candidate
+
+    return None
+
+
+def get_video_root_and_path(filename):
+    """파일명에서 번호를 추출해 올바른 VIDEO_ROOT 경로와 실제 파일 경로를 반환합니다."""
+    try:
+        # 파일 확장자 제거
+        file_id = filename.split(".")[0]
+
+        # KETI_SL_ 형식 확인
+        if not file_id.startswith("KETI_SL_"):
+            print(f"⚠️ KETI_SL_ 형식이 아닌 파일명: {filename}")
+            return None
+
+        # 숫자 부분 추출
+        number_str = file_id.replace("KETI_SL_", "")
+        if not number_str.isdigit():
+            print(f"⚠️ 숫자가 아닌 파일명: {filename}")
+            return None
+
+        num = int(number_str)
+
+        # 적절한 디렉토리 찾기
+        target_root = None
+        for (range_start, range_end), root_path in VIDEO_ROOTS:
+            if range_start <= num <= range_end:
+                target_root = root_path
+                break
+
+        if target_root is None:
+            print(f"⚠️ 번호 {num}에 해당하는 디렉토리를 찾을 수 없음: {filename}")
+            return None
+
+        # 파일 찾기
+        file_path = find_file_in_directory(target_root, filename)
+        if file_path:
+            return file_path
+
+        print(f"⚠️ 파일을 찾을 수 없음: {filename} (디렉토리: {target_root})")
+        return None
+
+    except Exception as e:
+        print(f"⚠️ 파일명 파싱 오류: {filename}, 오류: {e}")
+        return None
+
+
+def normalize_sequence_length(sequence, target_length=30):
+    """시퀀스 길이를 정규화합니다."""
+    current_length = len(sequence)
+
+    if current_length == target_length:
+        return sequence
+
+    x_old = np.linspace(0, 1, current_length)
+    x_new = np.linspace(0, 1, target_length)
+
+    normalized_sequence = []
+    for i in range(sequence.shape[1]):
+        f = interp1d(
+            x_old,
+            sequence[:, i],
+            kind="linear",
+            bounds_error=False,
+            fill_value="extrapolate",
         )
-        
-        # 파이프라인 상태
-        self.pipeline_stats = {
-            'start_time': None,
-            'end_time': None,
-            'extraction_results': [],
-            'upload_results': [],
-            'total_videos': 0,
-            'processed_videos': 0,
-            'failed_videos': 0
-        }
-    
-    def process_video_streaming(self, 
-                              video_path: Path,
-                              target_fps: int = 30,
-                              max_frames: Optional[int] = None,
-                              skip_existing: bool = True) -> Dict:
-        """
-        단일 비디오를 스트리밍 처리 (추출 + 업로드)
-        
-        Args:
-            video_path: 비디오 파일 경로
-            target_fps: 목표 FPS
-            max_frames: 최대 프레임 수
-            skip_existing: 기존 파일 건너뛰기 여부
-            
-        Returns:
-            처리 결과
-        """
-        try:
-            # 파일 존재 여부 확인
-            if not video_path.exists():
-                logger.error(f"비디오 파일이 존재하지 않습니다: {video_path}")
-                return {
-                    'video_path': str(video_path),
-                    'error': 'file_not_found',
-                    'status': 'failed'
-                }
-            
-            # 파일 크기 확인
-            file_size = video_path.stat().st_size
-            if file_size == 0:
-                logger.error(f"비디오 파일이 비어있습니다: {video_path}")
-                return {
-                    'video_path': str(video_path),
-                    'error': 'empty_file',
-                    'status': 'failed'
-                }
-            
-            # S3 키 생성
-            s3_key = f"{self.s3_prefix}/{video_path.stem}_sign_language_landmarks.pkl.gz"
-            
-            # 기존 파일 확인 (조기 건너뛰기)
-            if skip_existing and self.uploader.check_file_exists_simple(s3_key):
-                logger.info(f"이미 처리된 파일입니다: {video_path.name} -> {s3_key}")
-                return {
-                    'video_path': str(video_path),
-                    's3_key': s3_key,
-                    'status': 'skipped',
-                    'reason': 'file_already_exists_in_s3'
-                }
-            
-            logger.info(f"처리 시작: {video_path.name} ({file_size / (1024*1024):.2f} MB)")
-            
-            # 1단계: 메모리에서 시퀀스 추출
-            compressed_data, extraction_info = self.extractor.extract_sequence_to_memory(
-                str(video_path),
-                target_fps=target_fps,
-                max_frames=max_frames
-            )
-            
-            # 추출된 프레임 수 확인
-            if extraction_info['extracted_frames'] == 0:
-                logger.warning(f"랜드마크가 추출되지 않았습니다: {video_path}")
-                return {
-                    'video_path': str(video_path),
-                    'error': 'no_landmarks_detected',
-                    'status': 'failed'
-                }
-            
-            # 2단계: S3에 스트리밍 업로드
-            upload_result = self.uploader.upload_data_streaming(
-                compressed_data,
-                s3_key,
-                overwrite=False
-            )
-            
-            # 결과 통합
-            result = {
-                'video_path': str(video_path),
-                's3_key': s3_key,
-                'extraction_info': extraction_info,
-                'upload_result': upload_result,
-                'status': upload_result['status']
-            }
-            
-            logger.info(f"처리 완료: {video_path.name} -> {extraction_info['extracted_frames']} 프레임")
-            return result
-            
-        except Exception as e:
-            logger.error(f"비디오 처리 실패 {video_path}: {e}")
-            import traceback
-            logger.error(f"상세 오류: {traceback.format_exc()}")
-            return {
-                'video_path': str(video_path),
-                'error': str(e),
-                'status': 'failed'
-            }
-    
-    def run_streaming_pipeline(self, 
-                             target_fps: int = 30,
-                             max_frames: Optional[int] = None,
-                             skip_existing: bool = True,
-                             video_extensions: List[str] = ['.mp4', '.avi', '.mov', '.mkv']) -> Dict:
-        """
-        스트리밍 파이프라인 실행
-        
-        Args:
-            target_fps: 목표 FPS
-            max_frames: 최대 프레임 수
-            video_extensions: 지원하는 비디오 확장자
-            
-        Returns:
-            파이프라인 실행 결과
-        """
-        self.pipeline_stats['start_time'] = time.time()
-        
-        logger.info("=== 수어 인식용 미디어파이프 S3 스트리밍 파이프라인 시작 ===")
-        logger.info(f"비디오 디렉토리: {self.video_dir}")
-        logger.info(f"S3 버킷: {self.s3_bucket}")
-        logger.info(f"S3 접두사: {self.s3_prefix}")
-        logger.info(f"동시 처리 스레드: {self.max_workers}개")
-        logger.info(f"기존 파일 건너뛰기: {skip_existing}")
-        
-        # 비디오 파일 찾기
-        video_files = []
-        for ext in video_extensions:
-            video_files.extend(self.video_dir.glob(f"*{ext}"))
-            video_files.extend(self.video_dir.glob(f"*{ext.upper()}"))
-        
-        # 중복 제거 및 정렬
-        video_files = sorted(list(set(video_files)))
-        
-        # 파일 유효성 사전 검사
-        valid_video_files = []
-        for video_file in video_files:
-            try:
-                # 파일 존재 및 크기 확인
-                if not video_file.exists():
-                    logger.warning(f"파일이 존재하지 않습니다: {video_file}")
-                    continue
-                
-                file_size = video_file.stat().st_size
-                if file_size == 0:
-                    logger.warning(f"빈 파일입니다: {video_file}")
-                    continue
-                
-                # 최소 크기 확인 (1KB)
-                if file_size < 1024:
-                    logger.warning(f"파일이 너무 작습니다: {video_file} ({file_size} bytes)")
-                    continue
-                
-                valid_video_files.append(video_file)
-                
-            except Exception as e:
-                logger.warning(f"파일 검증 실패 {video_file}: {e}")
-                continue
-        
-        self.pipeline_stats['total_videos'] = len(valid_video_files)
-        logger.info(f"발견된 비디오 파일: {len(video_files)}개")
-        logger.info(f"유효한 비디오 파일: {len(valid_video_files)}개")
-        
-        if not valid_video_files:
-            logger.warning("처리할 유효한 비디오 파일이 없습니다.")
-            return {
-                'status': 'success',
-                'message': 'no_valid_videos_found',
-                'statistics': self.pipeline_stats
-            }
-        
-        results = []
-        
-        # 병렬 처리
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # 작업 제출
-            future_to_video = {}
-            for video_file in valid_video_files:
-                future = executor.submit(
-                    self.process_video_streaming,
-                    video_file,
-                    target_fps,
-                    max_frames,
-                    skip_existing
-                )
-                future_to_video[future] = video_file
-            
-            # 결과 수집
-            with tqdm(total=len(valid_video_files), desc="스트리밍 처리") as pbar:
-                for future in as_completed(future_to_video):
-                    result = future.result()
-                    results.append(result)
-                    pbar.update(1)
-                    
-                    # 진행률 표시 업데이트
-                    successful = [r for r in results if r['status'] == 'success']
-                    failed = [r for r in results if r['status'] == 'failed']
-                    skipped = [r for r in results if r['status'] == 'skipped']
-                    
-                    pbar.set_postfix({
-                        'Success': len(successful),
-                        'Failed': len(failed),
-                        'Skipped': len(skipped)
-                    })
-        
-        # 결과 분석
-        successful = [r for r in results if r['status'] == 'success']
-        failed = [r for r in results if r['status'] == 'failed']
-        skipped = [r for r in results if r['status'] == 'skipped']
-        
-        # 실패 원인 분석
-        error_counts = {}
-        for result in failed:
-            error_type = result.get('error', 'unknown_error')
-            if error_type in error_counts:
-                error_counts[error_type] += 1
+        normalized_sequence.append(f(x_new))
+
+    return np.array(normalized_sequence).T
+
+
+def extract_dynamic_features(sequence):
+    """속도와 가속도 특징을 추출합니다."""
+    velocity = np.diff(sequence, axis=0, prepend=sequence[0:1])
+    acceleration = np.diff(velocity, axis=0, prepend=velocity[0:1])
+    dynamic_features = np.concatenate([sequence, velocity, acceleration], axis=1)
+    return dynamic_features
+
+
+def convert_to_relative_coordinates(landmarks_list):
+    """절대 좌표를 어깨 중심 상대 좌표계로 변환합니다."""
+    relative_landmarks = []
+
+    for frame in landmarks_list:
+        if not frame["pose"]:
+            relative_landmarks.append(frame)
+            continue
+
+        pose_landmarks = frame["pose"].landmark
+
+        left_shoulder = pose_landmarks[11]
+        right_shoulder = pose_landmarks[12]
+        shoulder_center_x = (left_shoulder.x + right_shoulder.x) / 2
+        shoulder_center_y = (left_shoulder.y + right_shoulder.y) / 2
+        shoulder_center_z = (left_shoulder.z + right_shoulder.z) / 2
+
+        shoulder_width = abs(right_shoulder.x - left_shoulder.x)
+        if shoulder_width == 0:
+            shoulder_width = 1.0
+
+        new_frame = {}
+
+        if frame["pose"]:
+            relative_pose = []
+            for landmark in pose_landmarks:
+                rel_x = (landmark.x - shoulder_center_x) / shoulder_width
+                rel_y = (landmark.y - shoulder_center_y) / shoulder_width
+                rel_z = (landmark.z - shoulder_center_z) / shoulder_width
+                relative_pose.append([rel_x, rel_y, rel_z])
+            new_frame["pose"] = relative_pose
+
+        for hand_key in ["left_hand", "right_hand"]:
+            if frame[hand_key]:
+                relative_hand = []
+                for landmark in frame[hand_key].landmark:
+                    rel_x = (landmark.x - shoulder_center_x) / shoulder_width
+                    rel_y = (landmark.y - shoulder_center_y) / shoulder_width
+                    rel_z = (landmark.z - shoulder_center_z) / shoulder_width
+                    relative_hand.append([rel_x, rel_y, rel_z])
+                new_frame[hand_key] = relative_hand
             else:
-                error_counts[error_type] = 1
+                new_frame[hand_key] = None
+
+        relative_landmarks.append(new_frame)
+
+    return relative_landmarks
+
+
+def interpolate_individual_landmarks(landmarks_list):
+    """개별 랜드마크 포인트의 결측치를 interpolation으로 보완합니다."""
+    if not landmarks_list or len(landmarks_list) < 2:
+        return landmarks_list
+    
+    # 각 랜드마크 타입별 포인트 수
+    landmark_counts = {"pose": 33, "left_hand": 21, "right_hand": 21}
+    
+    # 각 타입별로 interpolation 수행
+    for landmark_type in ["pose", "left_hand", "right_hand"]:
+        num_points = landmark_counts[landmark_type]
         
-        self.pipeline_stats['processed_videos'] = len(successful)
-        self.pipeline_stats['failed_videos'] = len(failed)
-        self.pipeline_stats['skipped_videos'] = len(skipped)
-        self.pipeline_stats['extraction_results'] = results
-        self.pipeline_stats['error_analysis'] = error_counts
+        # 각 포인트별로 시간축 interpolation
+        for point_idx in range(num_points):
+            # 해당 포인트의 모든 프레임에서의 좌표 수집
+            x_coords, y_coords, z_coords = [], [], []
+            valid_frames = []
+            
+            for frame_idx, frame in enumerate(landmarks_list):
+                if frame.get(landmark_type):
+                    if isinstance(frame[landmark_type], list):
+                        if point_idx < len(frame[landmark_type]):
+                            point = frame[landmark_type][point_idx]
+                            x_coords.append(point[0])
+                            y_coords.append(point[1])
+                            z_coords.append(point[2])
+                            valid_frames.append(frame_idx)
+                    else:
+                        # MediaPipe landmark 객체인 경우
+                        landmarks = frame[landmark_type].landmark
+                        if point_idx < len(landmarks):
+                            x_coords.append(landmarks[point_idx].x)
+                            y_coords.append(landmarks[point_idx].y)
+                            z_coords.append(landmarks[point_idx].z)
+                            valid_frames.append(frame_idx)
+            
+            # 유효한 프레임이 2개 이상일 때만 interpolation 수행
+            if len(valid_frames) >= 2:
+                # 시간축 interpolation
+                x_interp = interp1d(valid_frames, x_coords, kind='linear', 
+                                   bounds_error=False, fill_value='extrapolate')
+                y_interp = interp1d(valid_frames, y_coords, kind='linear', 
+                                   bounds_error=False, fill_value='extrapolate')
+                z_interp = interp1d(valid_frames, z_coords, kind='linear', 
+                                   bounds_error=False, fill_value='extrapolate')
+                
+                # 모든 프레임에 대해 보간된 값 적용
+                for frame_idx in range(len(landmarks_list)):
+                    if frame_idx not in valid_frames:
+                        # 결측 프레임에 보간된 값 적용
+                        interpolated_x = float(x_interp(frame_idx))
+                        interpolated_y = float(y_interp(frame_idx))
+                        interpolated_z = float(z_interp(frame_idx))
+                        
+                        # 기존 프레임에 해당 타입이 없으면 생성
+                        if not landmarks_list[frame_idx].get(landmark_type):
+                            landmarks_list[frame_idx][landmark_type] = []
+                        
+                        # 리스트 형태로 변환
+                        if not isinstance(landmarks_list[frame_idx][landmark_type], list):
+                            landmarks_list[frame_idx][landmark_type] = [
+                                [l.x, l.y, l.z] for l in landmarks_list[frame_idx][landmark_type].landmark
+                            ]
+                        
+                        # 포인트 개수 맞추기
+                        while len(landmarks_list[frame_idx][landmark_type]) <= point_idx:
+                            landmarks_list[frame_idx][landmark_type].append([0, 0, 0])
+                        
+                        # 보간된 값 적용
+                        landmarks_list[frame_idx][landmark_type][point_idx] = [
+                            interpolated_x, interpolated_y, interpolated_z
+                        ]
+    
+    return landmarks_list
+
+
+def apply_temporal_smoothing(landmarks_list, window_size=3, alpha=0.7):
+    """시간적 smoothing을 적용하여 랜드마크 변화를 부드럽게 만듭니다."""
+    if not landmarks_list or len(landmarks_list) < 2:
+        return landmarks_list
+    
+    smoothed_landmarks = []
+    landmark_counts = {"pose": 33, "left_hand": 21, "right_hand": 21}
+    
+    for frame_idx, frame in enumerate(landmarks_list):
+        smoothed_frame = {}
         
-        self.pipeline_stats['end_time'] = time.time()
+        for landmark_type in ["pose", "left_hand", "right_hand"]:
+            if not frame.get(landmark_type):
+                smoothed_frame[landmark_type] = None
+                continue
+            
+            num_points = landmark_counts[landmark_type]
+            smoothed_landmarks_type = []
+            
+            # 리스트 형태로 변환
+            if not isinstance(frame[landmark_type], list):
+                current_landmarks = [[l.x, l.y, l.z] for l in frame[landmark_type].landmark]
+            else:
+                current_landmarks = frame[landmark_type].copy()
+            
+            # 각 포인트별로 smoothing 적용
+            for point_idx in range(num_points):
+                if point_idx >= len(current_landmarks):
+                    current_landmarks.append([0, 0, 0])
+                
+                # 윈도우 내의 이전 프레임들 수집
+                window_coords = []
+                for w in range(max(0, frame_idx - window_size + 1), frame_idx + 1):
+                    if w < len(landmarks_list) and landmarks_list[w].get(landmark_type):
+                        if isinstance(landmarks_list[w][landmark_type], list):
+                            if point_idx < len(landmarks_list[w][landmark_type]):
+                                window_coords.append(landmarks_list[w][landmark_type][point_idx])
+                        else:
+                            landmarks = landmarks_list[w][landmark_type].landmark
+                            if point_idx < len(landmarks):
+                                window_coords.append([landmarks[point_idx].x, 
+                                                    landmarks[point_idx].y, 
+                                                    landmarks[point_idx].z])
+                
+                if window_coords:
+                    # 가중 평균 계산 (최근 프레임에 더 높은 가중치)
+                    weights = np.exp(alpha * np.arange(len(window_coords)))
+                    weights = weights / np.sum(weights)
+                    
+                    smoothed_point = [0, 0, 0]
+                    for i, coord in enumerate(window_coords):
+                        for j in range(3):
+                            smoothed_point[j] += coord[j] * weights[i]
+                    
+                    smoothed_landmarks_type.append(smoothed_point)
+                else:
+                    smoothed_landmarks_type.append(current_landmarks[point_idx])
+            
+            smoothed_frame[landmark_type] = smoothed_landmarks_type
         
-        # 최종 결과 요약
-        duration = self.pipeline_stats['end_time'] - self.pipeline_stats['start_time']
-        logger.info("=== 수어 인식 스트리밍 파이프라인 완료 ===")
-        logger.info(f"총 실행 시간: {duration:.2f}초")
-        logger.info(f"처리된 비디오: {len(successful)}/{len(valid_video_files)}")
-        logger.info(f"실패한 비디오: {len(failed)}개")
-        logger.info(f"건너뛴 비디오: {len(skipped)}개")
+        smoothed_landmarks.append(smoothed_frame)
+    
+    return smoothed_landmarks
+
+
+def check_spatial_consistency_and_correct(landmarks_list):
+    """공간적 일관성을 검사하고 보정합니다."""
+    if not landmarks_list:
+        return landmarks_list
+    
+    corrected_landmarks = []
+    landmark_counts = {"pose": 33, "left_hand": 21, "right_hand": 21}
+    
+    # 손목-손가락 연결성 검사 및 보정
+    hand_connections = {
+        "left_hand": [(0, 1), (1, 2), (2, 3), (3, 4),  # 엄지
+                     (0, 5), (5, 6), (6, 7), (7, 8),  # 검지
+                     (0, 9), (9, 10), (10, 11), (11, 12),  # 중지
+                     (0, 13), (13, 14), (14, 15), (15, 16),  # 약지
+                     (0, 17), (17, 18), (18, 19), (19, 20)],  # 새끼
+        "right_hand": [(0, 1), (1, 2), (2, 3), (3, 4),  # 엄지
+                      (0, 5), (5, 6), (6, 7), (7, 8),  # 검지
+                      (0, 9), (9, 10), (10, 11), (11, 12),  # 중지
+                      (0, 13), (13, 14), (14, 15), (15, 16),  # 약지
+                      (0, 17), (17, 18), (18, 19), (19, 20)]  # 새끼
+    }
+    
+    for frame_idx, frame in enumerate(landmarks_list):
+        corrected_frame = {}
         
-        if skipped:
-            logger.info("=== 건너뛴 파일 상세 ===")
-            for result in skipped:
-                reason = result.get('reason', 'unknown')
-                logger.info(f"  {Path(result['video_path']).name}: {reason}")
+        for landmark_type in ["pose", "left_hand", "right_hand"]:
+            if not frame.get(landmark_type):
+                corrected_frame[landmark_type] = None
+                continue
+            
+            # 리스트 형태로 변환
+            if not isinstance(frame[landmark_type], list):
+                current_landmarks = [[l.x, l.y, l.z] for l in frame[landmark_type].landmark]
+            else:
+                current_landmarks = frame[landmark_type].copy()
+            
+            # 손의 경우 연결성 검사 및 보정
+            if landmark_type in ["left_hand", "right_hand"]:
+                corrected_landmarks_type = current_landmarks.copy()
+                
+                # 각 연결에 대해 거리 검사
+                for start_idx, end_idx in hand_connections[landmark_type]:
+                    if (start_idx < len(corrected_landmarks_type) and 
+                        end_idx < len(corrected_landmarks_type)):
+                        
+                        start_point = corrected_landmarks_type[start_idx]
+                        end_point = corrected_landmarks_type[end_idx]
+                        
+                        # 거리 계산
+                        distance = np.sqrt(sum((np.array(start_point) - np.array(end_point))**2))
+                        
+                        # 비정상적으로 긴 거리인 경우 보정
+                        max_reasonable_distance = 0.3  # 임계값
+                        if distance > max_reasonable_distance:
+                            # 중간점으로 보정
+                            mid_point = [(start_point[i] + end_point[i]) / 2 for i in range(3)]
+                            
+                            # 시작점과 끝점을 중간점으로부터 적절한 거리로 조정
+                            direction = np.array(end_point) - np.array(start_point)
+                            if np.linalg.norm(direction) > 0:
+                                direction = direction / np.linalg.norm(direction)
+                                corrected_distance = max_reasonable_distance / 2
+                                
+                                corrected_landmarks_type[start_idx] = [
+                                    mid_point[i] - direction[i] * corrected_distance for i in range(3)
+                                ]
+                                corrected_landmarks_type[end_idx] = [
+                                    mid_point[i] + direction[i] * corrected_distance for i in range(3)
+                                ]
+                
+                corrected_frame[landmark_type] = corrected_landmarks_type
+            else:
+                # 포즈의 경우 기본 검사
+                corrected_frame[landmark_type] = current_landmarks
         
-        # 실패 원인 상세 분석
-        if error_counts:
-            logger.info("=== 실패 원인 분석 ===")
-            for error_type, count in sorted(error_counts.items(), key=lambda x: x[1], reverse=True):
-                percentage = (count / len(failed)) * 100
-                logger.info(f"  {error_type}: {count}개 ({percentage:.1f}%)")
-        
-        if successful:
-            total_size = sum(r['extraction_info']['file_size_mb'] for r in successful)
-            avg_compression = sum(r['extraction_info']['compression_ratio'] for r in successful) / len(successful)
-            logger.info(f"총 업로드 크기: {total_size:.2f} MB")
-            logger.info(f"평균 압축률: {avg_compression:.2%}")
-        
-        return {
-            'status': 'success',
-            'duration': duration,
-            'results': results,
-            'statistics': self.pipeline_stats,
-            'error_analysis': error_counts
-        }
+        corrected_landmarks.append(corrected_frame)
+    
+    return corrected_landmarks
+
+
+def enhanced_preprocess_landmarks(landmarks_list):
+    """개선된 랜드마크 전처리 함수 - interpolation, smoothing, 일관성 검사 포함."""
+    if not landmarks_list:
+        return np.zeros((TARGET_SEQ_LENGTH, 675))
+
+    print("    🔧 개별 랜드마크 interpolation 적용 중...")
+    # 1. 개별 랜드마크 포인트 interpolation
+    interpolated_landmarks = interpolate_individual_landmarks(landmarks_list)
+    
+    print("    🔧 시간적 smoothing 적용 중...")
+    # 2. 시간적 smoothing 적용
+    smoothed_landmarks = apply_temporal_smoothing(interpolated_landmarks)
+    
+    print("    🔧 공간적 일관성 검사 및 보정 중...")
+    # 3. 공간적 일관성 검사 및 보정
+    corrected_landmarks = check_spatial_consistency_and_correct(smoothed_landmarks)
+    
+    # 기존 전처리 로직 적용
+    relative_landmarks = convert_to_relative_coordinates(corrected_landmarks)
+
+    processed_frames = []
+    for frame in relative_landmarks:
+        combined = []
+        for key in ["pose", "left_hand", "right_hand"]:
+            if frame[key]:
+                if isinstance(frame[key], list):
+                    combined.extend(frame[key])
+                else:
+                    combined.extend([[l.x, l.y, l.z] for l in frame[key].landmark])
+            else:
+                num_points = {"pose": 33, "left_hand": 21, "right_hand": 21}[key]
+                combined.extend([[0, 0, 0]] * num_points)
+
+        if combined:
+            processed_frames.append(np.array(combined).flatten())
+        else:
+            processed_frames.append(np.zeros(75 * 3))
+
+    if not processed_frames:
+        return np.zeros((TARGET_SEQ_LENGTH, 675))
+
+    sequence = np.array(processed_frames)
+
+    if len(sequence) > 0:
+        try:
+            sequence = normalize_sequence_length(sequence, TARGET_SEQ_LENGTH)
+            sequence = extract_dynamic_features(sequence)
+
+            # 정규화 개선: 더 강한 정규화
+            sequence = (sequence - np.mean(sequence)) / (np.std(sequence) + 1e-8)
+
+            return sequence
+        except Exception as e:
+            print(f"⚠️ 시퀀스 처리 중 오류 발생: {e}")
+            return np.zeros((TARGET_SEQ_LENGTH, 675))
+
+    return np.zeros((TARGET_SEQ_LENGTH, 675))
+
+
+def augment_sequence_improved(
+    sequence,
+    noise_level=AUGMENTATION_NOISE_LEVEL,
+    scale_range=AUGMENTATION_SCALE_RANGE,
+    rotation_range=AUGMENTATION_ROTATION_RANGE,
+):
+    """개선된 시퀀스 증강."""
+    augmented = sequence.copy()
+
+    # 노이즈 추가
+    noise = np.random.normal(0, noise_level, augmented.shape)
+    augmented += noise
+
+    # 스케일링
+    scale_factor = np.random.uniform(1 - scale_range, 1 + scale_range)
+    augmented *= scale_factor
+
+    # 시간축에서의 회전 (시프트)
+    shift = np.random.randint(-3, 4)
+    if shift > 0:
+        augmented = np.roll(augmented, shift, axis=0)
+    elif shift < 0:
+        augmented = np.roll(augmented, shift, axis=0)
+
+    return augmented
+
+
+def extract_landmarks_with_holistic(video_path, holistic):
+    """전달받은 MediaPipe 객체를 사용하여 랜드마크를 추출합니다."""
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"⚠️ 비디오 파일을 열 수 없음: {video_path}")
+            return None
+
+        # 비디오 정보 확인
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        print(f"    📊 비디오 정보: {total_frames}프레임, {fps:.1f}fps")
+
+        landmarks_list = []
+        frame_count = 0
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # 프레임 처리
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = holistic.process(rgb_frame)
+
+            frame_data = {
+                "pose": results.pose_landmarks,
+                "left_hand": results.left_hand_landmarks,
+                "right_hand": results.right_hand_landmarks,
+            }
+            landmarks_list.append(frame_data)
+            frame_count += 1
+            
+        cap.release()
+        print(f"    ✅ 랜드마크 추출 완료: {len(landmarks_list)}프레임")
+        return landmarks_list
+
+    except (cv2.error, OSError) as e:
+        print(f"⚠️ 비디오 파일 읽기 오류: {video_path}, 오류: {e}")
+        return None
+    except Exception as e:
+        print(f"⚠️ 랜드마크 추출 중 예상치 못한 오류: {video_path}, 오류: {e}")
+        return None
+
+
+def get_action_index(label, actions):
+    """라벨의 인덱스를 반환합니다."""
+    return actions.index(label)
+
+
+def get_all_video_paths():
+    video_paths = []
+
+    return video_paths
+
 
 def main():
-    parser = argparse.ArgumentParser(description='수어 인식용 미디어파이프 S3 스트리밍 파이프라인')
-    parser.add_argument('--video-dir', '-v', required=True, help='비디오 디렉토리')
-    parser.add_argument('--s3-bucket', '-b', required=True, help='S3 버킷 이름')
-    parser.add_argument('--s3-prefix', '-p', required=True, help='S3 접두사')
-    parser.add_argument('--aws-region', default='us-east-1', help='AWS 리전')
-    parser.add_argument('--target-fps', type=int, default=30, help='목표 FPS')
-    parser.add_argument('--max-frames', type=int, help='최대 프레임 수')
-    parser.add_argument('--max-workers', type=int, default=4, help='동시 처리 스레드 수')
-    parser.add_argument('--model-complexity', type=int, default=1, choices=[0, 1, 2], help='모델 복잡도')
-    parser.add_argument('--skip-existing', action='store_true', default=True, help='S3에 이미 존재하는 파일 건너뛰기')
-    parser.add_argument('--force-overwrite', action='store_true', help='기존 파일 덮어쓰기 (--skip-existing 무시)')
-    args = parser.parse_args()
-    
-    # 스트리밍 파이프라인 초기화
-    pipeline = MediaPipeS3StreamingPipeline(
-        video_dir=args.video_dir,
-        s3_bucket=args.s3_bucket,
-        s3_prefix=args.s3_prefix,
-        aws_region=args.aws_region,
-        max_workers=args.max_workers,
-        model_complexity=args.model_complexity,
-        min_detection_confidence=0.3,  # 더 관대한 설정
-        min_tracking_confidence=0.3    # 더 관대한 설정
-    )
-    
-    # skip_existing 설정 결정
-    skip_existing = args.skip_existing and not args.force_overwrite
-    
-    # 스트리밍 파이프라인 실행
-    result = pipeline.run_streaming_pipeline(
-        target_fps=args.target_fps,
-        max_frames=args.max_frames,
-        skip_existing=skip_existing
-    )
-    
-    if result['status'] == 'success':
-        logger.info("수어 인식 스트리밍 파이프라인이 성공적으로 완료되었습니다!")
+    """메인 실행 함수"""
+    params = sys.argv[1]
+    with open(params, "r") as f:
+        params = json.load(f)
+    label_dict = params["label_dict"]
+
+    ACTIONS = list(label_dict.keys())
+    NONE_CLASS = ACTIONS[-1]
+
+    print(f"🔧 라벨 목록: {ACTIONS}")
+    # 1. 비디오 루트 디렉토리 검증
+    valid_roots = validate_video_roots()
+    if not valid_roots:
+        print("❌ 유효한 비디오 루트 디렉토리가 없습니다.")
+        sys.exit(1)
+
+    # 2. labels.csv 파일 읽기 및 검증
+    if not os.path.exists("labels.csv"):
+        print("❌ labels.csv 파일이 없습니다.")
+        sys.exit(1)
+
+    labels_df = pd.read_csv("labels.csv")
+    print(f"📊 labels.csv 로드 완료: {len(labels_df)}개 항목")
+    print(labels_df.head())
+
+    # 3. 파일명에서 비디오 루트 경로 추출 (개선된 방식)
+    print("\n🔍 파일명 분석 및 경로 매핑 중...")
+    file_mapping = {}
+    found_files = 0
+    missing_files = 0
+    filtered_files = 0
+
+    # 라벨별로 파일을 모아서 최대 개수만큼만 샘플링
+    label_to_files = defaultdict(list)
+    for idx, row in labels_df.iterrows():
+        filename = row["파일명"]
+        label = row["한국어"]
+        if label not in ACTIONS:
+            continue
+        file_path = get_video_root_and_path(filename)
+        if file_path:
+            label_to_files[label].append((filename, file_path))
+            found_files += 1
+            filtered_files += 1
+        else:
+            missing_files += 1
+
+    # 최대 개수만큼만 샘플링
+    for label in ACTIONS:
+        files = label_to_files[label]
+        if LABEL_MAX_SAMPLES_PER_CLASS is not None:
+            files = files[:LABEL_MAX_SAMPLES_PER_CLASS]
+        for filename, file_path in files:
+            file_mapping[filename] = {"path": file_path, "label": label}
+
+    # [수정] 라벨별 원본 영상 개수 체크 및 최소 개수 미달 시 학습 중단 (None은 예외)
+    insufficient_labels = []
+    for label in ACTIONS:
+        if label == NONE_CLASS:
+            continue  # None 클래스는 예외
+        num_samples = len(label_to_files[label])
+        if num_samples < MIN_SAMPLES_PER_CLASS:
+            insufficient_labels.append((label, num_samples))
+    if insufficient_labels:
+        print("\n❌ 최소 샘플 개수 미달 라벨 발견! 학습을 중단합니다.")
+        for label, count in insufficient_labels:
+            print(f"   - {label}: {count}개 (최소 필요: {MIN_SAMPLES_PER_CLASS}개)")
+        sys.exit(1)
+
+    print(f"\n📊 파일 매핑 결과:")
+    print(f"   ✅ 찾은 파일: {found_files}개")
+    print(f"   ❌ 누락된 파일: {missing_files}개")
+    print(f"   🎯 ACTIONS 라벨에 해당하는 파일: {filtered_files}개")
+    print(f"   ⚡ 라벨별 최대 {LABEL_MAX_SAMPLES_PER_CLASS}개 파일만 사용")
+    print(f"   ⚡ 라벨별 최소 {MIN_SAMPLES_PER_CLASS}개 파일 필요")
+
+    if len(file_mapping) == 0:
+        print("❌ 찾을 수 있는 파일이 없습니다.")
+        sys.exit(1)
+
+    # 4. 라벨별 데이터 추출 및 캐싱 (개별 처리)
+    print("\n🚀 라벨별 데이터 추출 및 캐싱 시작...")
+
+    # None 클래스 제외한 다른 클래스들의 평균 개수 계산
+    other_class_counts = {}
+    for filename, info in file_mapping.items():
+        if info["label"] != NONE_CLASS:
+            label = info["label"]
+            other_class_counts[label] = other_class_counts.get(label, 0) + 1
+
+    if other_class_counts:
+        avg_other_class_count = sum(other_class_counts.values()) / len(
+            other_class_counts
+        )
+        target_none_count = int(avg_other_class_count * (1 + AUGMENTATIONS_PER_VIDEO))
+        print(
+            f"📊 다른 클래스 평균: {avg_other_class_count:.1f}개 → None 클래스 목표: {target_none_count}개"
+        )
     else:
-        logger.error(f"수어 인식 스트리밍 파이프라인 실패: {result.get('error', 'Unknown error')}")
-        exit(1)
+        target_none_count = None
+        print(f"📊 다른 클래스가 없음 → None 클래스 기본값 사용")
+
+    X = []
+    y = []
+
+    for label in ACTIONS:
+        print(f"\n{'='*50}")
+        print(f"📋 {label} 라벨 처리 중...")
+        print(f"{'='*50}")
+
+        if label == NONE_CLASS:
+            label_data = generate_balanced_none_class_data(
+                file_mapping, NONE_CLASS, target_none_count
+            )
+        else:
+            label_data = extract_and_cache_label_data_optimized(file_mapping, label)
+
+        if label_data:
+            label_index = get_action_index(label, ACTIONS)
+            X.extend(label_data)
+            y.extend([label_index] * len(label_data))
+            print(f"✅ {label}: {len(label_data)}개 샘플 추가됨")
+        else:
+            print(f"⚠️ {label}: 데이터가 없습니다.")
+
+    print(f"\n{'='*50}")
+    print(f"📊 최종 데이터 통계:")
+    print(f"{'='*50}")
+    print(f"총 샘플 수: {len(X)}")
+
+    # 클래스별 샘플 수 확인
+    unique, counts = np.unique(y, return_counts=True)
+    for class_idx, count in zip(unique, counts):
+        if 0 <= class_idx < len(ACTIONS):
+            print(f"클래스 {class_idx} ({ACTIONS[class_idx]}): {count}개")
+        else:
+            print(f"클래스 {class_idx} (Unknown): {count}개")
+
+    
+
 
 if __name__ == "__main__":
-    main() 
+    print("🔧 학습 데이터 문제 해결 및 모델 재학습 시작")
+
+    try:
+        # 데이터 처리 및 모델 재학습
+        main()
+
+    except KeyboardInterrupt:
+        print("\n⚠️ 사용자에 의해 중단됨")
+    except Exception as e:
+        print(f"\n❌ 예상치 못한 오류 발생: {e}")
+        import traceback
+
+        traceback.print_exc()
+    finally:
+        # MediaPipe 객체 정리
+        MediaPipeManager.cleanup()
+        print("\n🧹 리소스 정리 완료")

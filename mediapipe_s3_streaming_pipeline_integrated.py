@@ -420,6 +420,11 @@ def enhanced_preprocess_landmarks(landmarks_list):
     if len(sequence) > 0:
         try:
             sequence = normalize_sequence_length(sequence, TARGET_SEQ_LENGTH)
+            
+            # 기본 sequence 구조 검증 (속도, 가속도 추가 전)
+            print("    🔍 기본 sequence 구조 검증 중...")
+            validate_sequence_structure(sequence)
+            
             sequence = extract_dynamic_features(sequence)
 
             # 정규화 개선: 더 강한 정규화

@@ -425,6 +425,10 @@ def enhanced_preprocess_landmarks(landmarks_list):
             print("    🔍 기본 sequence 구조 검증 중...")
             validate_sequence_structure(sequence)
             
+            # 랜드마크 분포 분석
+            print("    📊 랜드마크 분포 분석 중...")
+            analyze_landmark_distribution(sequence)
+            
             sequence = extract_dynamic_features(sequence)
 
             # 정규화 개선: 더 강한 정규화
@@ -477,9 +481,21 @@ def validate_sequence_structure(sequence, frame_idx=0):
         print("❌ sequence가 비어있습니다.")
         return False
     
-    # 기본 sequence (속도, 가속도 제외)
-    base_sequence_length = sequence.shape[1] // 3  # velocity, acceleration 제외
-    frame_data = sequence[frame_idx][:base_sequence_length]
+    # 현재 sequence가 기본 형태인지 동적 특징이 포함된 형태인지 확인
+    current_length = sequence.shape[1]
+    expected_basic_length = 225  # pose(33) + left_hand(21) + right_hand(21) = 75 * 3 = 225
+    
+    if current_length == expected_basic_length:
+        # 기본 sequence (속도, 가속도 제외)
+        frame_data = sequence[frame_idx]
+        base_sequence_length = current_length
+    elif current_length == expected_basic_length * 3:
+        # 동적 특징이 포함된 sequence (위치 + 속도 + 가속도)
+        frame_data = sequence[frame_idx][:expected_basic_length]
+        base_sequence_length = expected_basic_length
+    else:
+        print(f"❌ 예상치 못한 sequence 길이: {current_length}")
+        return False
     
     # 예상되는 랜드마크 개수
     expected_counts = {
@@ -510,10 +526,97 @@ def validate_sequence_structure(sequence, frame_idx=0):
         print(f"      범위: {start_idx} ~ {end_idx-1}")
         print(f"      샘플 데이터: {landmark_data[:6]}...")  # 처음 6개 값 (2개 랜드마크)
         
+        # 데이터 품질 검사
+        non_zero_count = np.count_nonzero(landmark_data)
+        print(f"      비영값 개수: {non_zero_count}/{len(landmark_data)} ({non_zero_count/len(landmark_data)*100:.1f}%)")
+        
         start_idx = end_idx
     
     print("✅ Sequence 구조가 올바르게 구성되었습니다.")
     return True
+
+
+def analyze_landmark_distribution(sequence, frame_idx=0):
+    """랜드마크 데이터의 분포를 분석합니다."""
+    if sequence is None or len(sequence) == 0:
+        return
+    
+    # 현재 sequence가 기본 형태인지 동적 특징이 포함된 형태인지 확인
+    current_length = sequence.shape[1]
+    expected_basic_length = 225  # pose(33) + left_hand(21) + right_hand(21) = 75 * 3 = 225
+    
+    if current_length == expected_basic_length:
+        # 기본 sequence (속도, 가속도 제외)
+        frame_data = sequence[frame_idx]
+    elif current_length == expected_basic_length * 3:
+        # 동적 특징이 포함된 sequence (위치 + 속도 + 가속도)
+        frame_data = sequence[frame_idx][:expected_basic_length]
+    else:
+        print(f"❌ 예상치 못한 sequence 길이: {current_length}")
+        return
+    
+    expected_counts = {
+        "pose": 33,
+        "left_hand": 21, 
+        "right_hand": 21
+    }
+    
+    print(f"📊 랜드마크 분포 분석 (프레임 {frame_idx}):")
+    
+    start_idx = 0
+    for landmark_type, count in expected_counts.items():
+        end_idx = start_idx + count * 3
+        landmark_data = frame_data[start_idx:end_idx]
+        
+        # 빈 배열인지 확인
+        if len(landmark_data) == 0:
+            print(f"   📍 {landmark_type}: 데이터 없음")
+            start_idx = end_idx
+            continue
+        
+        # x, y, z 좌표별로 분석
+        x_coords = landmark_data[0::3]
+        y_coords = landmark_data[1::3]
+        z_coords = landmark_data[2::3]
+        
+        print(f"   📍 {landmark_type}:")
+        print(f"      X 좌표: 평균={np.mean(x_coords):.4f}, 표준편차={np.std(x_coords):.4f}, 범위=[{np.min(x_coords):.4f}, {np.max(x_coords):.4f}]")
+        print(f"      Y 좌표: 평균={np.mean(y_coords):.4f}, 표준편차={np.std(y_coords):.4f}, 범위=[{np.min(y_coords):.4f}, {np.max(y_coords):.4f}]")
+        print(f"      Z 좌표: 평균={np.mean(z_coords):.4f}, 표준편차={np.std(z_coords):.4f}, 범위=[{np.min(z_coords):.4f}, {np.max(z_coords):.4f}]")
+        
+        start_idx = end_idx
+
+
+def get_sequence_structure_info():
+    """sequence의 구조 정보를 반환합니다."""
+    expected_counts = {
+        "pose": 33,
+        "left_hand": 21, 
+        "right_hand": 21
+    }
+    
+    total_landmarks = sum(expected_counts.values())
+    total_coordinates = total_landmarks * 3  # x, y, z
+    
+    print(f"📋 Sequence 구조 정보:")
+    print(f"   🎯 랜드마크 구성:")
+    for landmark_type, count in expected_counts.items():
+        print(f"      - {landmark_type}: {count}개 랜드마크 ({count * 3}개 좌표)")
+    
+    print(f"   📊 총 랜드마크: {total_landmarks}개")
+    print(f"   📊 총 좌표: {total_coordinates}개 (x, y, z)")
+    print(f"   📊 기본 sequence 길이: {total_coordinates}")
+    print(f"   📊 최종 sequence 길이: {total_coordinates * 3} (위치 + 속도 + 가속도)")
+    
+    # 순서 정보
+    start_idx = 0
+    print(f"   📍 데이터 순서:")
+    for landmark_type, count in expected_counts.items():
+        end_idx = start_idx + count * 3
+        print(f"      {start_idx:3d}-{end_idx-1:3d}: {landmark_type} ({count}개 랜드마크)")
+        start_idx = end_idx
+    
+    return expected_counts
 
 
 
@@ -829,8 +932,8 @@ def extract_and_cache_label_data_optimized(file_mapping, label):
 
     print(f"✅ {label} 라벨 데이터 추출 완료: {len(label_data)}개 샘플")
 
-    # 캐시에 저장
-    save_label_cache(label, label_data)
+    # S3 전용 저장 (로컬 캐시 비활성화)
+    cache_data = save_label_cache(label, label_data)
 
     return label_data
 
@@ -926,15 +1029,11 @@ def augment_sequence_improved(
 
 
 def save_label_cache(label, data):
-    """라벨별 데이터를 캐시에 저장합니다."""
-    cache_path = get_label_cache_path(label)
+    """라벨별 데이터를 S3에만 저장합니다 (로컬 캐시 비활성화)."""
+    # 로컬 캐시 저장 비활성화 - S3에만 저장
+    print(f"💾 {label} 라벨 데이터 S3 전용 저장 ({len(data)}개 샘플)")
     
-    # 캐시 디렉토리가 없으면 생성
-    cache_dir = os.path.dirname(cache_path)
-    if not os.path.exists(cache_dir):
-        os.makedirs(cache_dir, exist_ok=True)
-
-    # 캐시에 저장할 데이터와 파라미터 정보
+    # 캐시 데이터 구조는 유지 (S3 업로드 시 사용)
     cache_data = {
         "data": data,
         "parameters": {
@@ -950,23 +1049,8 @@ def save_label_cache(label, data):
             "MIN_SAMPLES_PER_CLASS": MIN_SAMPLES_PER_CLASS,
         },
     }
-
-    # 임시 파일에 먼저 저장 (원자적 쓰기)
-    temp_path = cache_path + ".tmp"
-
-    try:
-        with open(temp_path, "wb") as f:
-            pickle.dump(cache_data, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-        # 성공적으로 저장되면 최종 위치로 이동
-        os.replace(temp_path, cache_path)
-        print(f"💾 {label} 라벨 데이터 캐시 저장: {cache_path} ({len(data)}개 샘플)")
-
-    except Exception as e:
-        # 오류 발생 시 임시 파일 정리
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-        raise e
+    
+    return cache_data
 
 # 라벨별 캐시 파일 경로 생성 함수
 def get_label_cache_path(label):
@@ -996,6 +1080,7 @@ if __name__ == "__main__":
     parser.add_argument('--s3-prefix', type=str, default='feature-extraction-cache', help='S3 업로드 경로 prefix (기본값: feature-extraction-cache)')
     parser.add_argument('--region', type=str, default='ap-northeast-2', help='S3 리전 (기본값: ap-northeast-2)')
     parser.add_argument('--upload', action='store_true', default=True, help='S3 업로드 실행 (기본값: True)')
+    parser.add_argument('--clean-cache', action='store_true', help='기존 로컬 캐시 파일 정리')
     args = parser.parse_args()
     uploader = S3StreamingUploader(args.s3_bucket, args.s3_prefix, args.region)
 
@@ -1009,6 +1094,22 @@ if __name__ == "__main__":
     NONE_CLASS = ACTIONS[-1]
 
     print(f"🔧 라벨 목록: {ACTIONS}")
+    
+    # 기존 로컬 캐시 정리 (옵션)
+    if args.clean_cache:
+        print(f"\n🧹 기존 로컬 캐시 정리 중...")
+        if os.path.exists(CACHE_DIR):
+            import shutil
+            shutil.rmtree(CACHE_DIR)
+            print(f"✅ 로컬 캐시 디렉토리 정리 완료: {CACHE_DIR}")
+        else:
+            print(f"ℹ️ 로컬 캐시 디렉토리가 존재하지 않습니다: {CACHE_DIR}")
+    
+    # Sequence 구조 정보 출력
+    print("\n" + "="*60)
+    get_sequence_structure_info()
+    print("="*60)
+    
     # 1. 비디오 루트 디렉토리 검증
     valid_roots = validate_video_roots()
     if not valid_roots:
@@ -1121,6 +1222,21 @@ if __name__ == "__main__":
             X.extend(label_data)
             y.extend([label_index] * len(label_data))
             print(f"✅ {label}: {len(label_data)}개 샘플 추가됨")
+            
+            # S3 업로드 (각 라벨별로 개별 업로드)
+            if args.upload:
+                # 로컬 캐시와 동일한 파일명 규칙 사용
+                cache_path = get_label_cache_path(label)
+                cache_filename = os.path.basename(cache_path)
+                s3_key = f"{args.s3_prefix}/{cache_filename}.gz"
+                print(f"☁️ S3 업로드 중: {s3_key}")
+                try:
+                    # 캐시 데이터 구조로 S3에 업로드
+                    cache_data = save_label_cache(label, label_data)
+                    uploader.upload_pickle_gzip(cache_data, s3_key)
+                    print(f"✅ S3 업로드 완료: {s3_key}")
+                except Exception as e:
+                    print(f"❌ S3 업로드 실패: {s3_key} - {str(e)}")
         else:
             print(f"⚠️ {label}: 데이터가 없습니다.")
 
@@ -1137,11 +1253,38 @@ if __name__ == "__main__":
         else:
             print(f"클래스 {class_idx} (Unknown): {count}개")
 
-    # S3 업로드
-    if args.upload:
-        s3_key = f"{args.s3_prefix}/{label}.pkl.gz"
-        print(f"S3 업로드: {s3_key}")
-        uploader.upload_pickle_gzip(label_data, s3_key)
-        print(f"✅ S3 업로드 완료: {s3_key}")
+    # 전체 데이터셋을 S3에 업로드 (선택사항)
+    if args.upload and X:
+        print(f"\n☁️ 전체 데이터셋 S3 업로드 중...")
+        try:
+            full_dataset = {
+                "X": X,
+                "y": y,
+                "actions": ACTIONS,
+                "parameters": {
+                    "TARGET_SEQ_LENGTH": TARGET_SEQ_LENGTH,
+                    "AUGMENTATIONS_PER_VIDEO": AUGMENTATIONS_PER_VIDEO,
+                    "AUGMENTATION_NOISE_LEVEL": AUGMENTATION_NOISE_LEVEL,
+                    "AUGMENTATION_SCALE_RANGE": AUGMENTATION_SCALE_RANGE,
+                    "AUGMENTATION_ROTATION_RANGE": AUGMENTATION_ROTATION_RANGE,
+                    "NONE_CLASS_NOISE_LEVEL": NONE_CLASS_NOISE_LEVEL,
+                    "NONE_CLASS_AUGMENTATIONS_PER_FRAME": NONE_CLASS_AUGMENTATIONS_PER_FRAME,
+                    "LABEL_MAX_SAMPLES_PER_CLASS": LABEL_MAX_SAMPLES_PER_CLASS,
+                    "MIN_SAMPLES_PER_CLASS": MIN_SAMPLES_PER_CLASS,
+                }
+            }
+            # 전체 데이터셋 파일명에 파라미터 정보 포함
+            max_samples_str = (
+                f"max{LABEL_MAX_SAMPLES_PER_CLASS}"
+                if LABEL_MAX_SAMPLES_PER_CLASS
+                else "maxNone"
+            )
+            min_samples_str = f"min{MIN_SAMPLES_PER_CLASS}"
+            full_dataset_filename = f"full_dataset_seq{TARGET_SEQ_LENGTH}_aug{AUGMENTATIONS_PER_VIDEO}_{max_samples_str}_{min_samples_str}.pkl.gz"
+            full_dataset_s3_key = f"{args.s3_prefix}/{full_dataset_filename}"
+            uploader.upload_pickle_gzip(full_dataset, full_dataset_s3_key)
+            print(f"✅ 전체 데이터셋 S3 업로드 완료: {full_dataset_s3_key}")
+        except Exception as e:
+            print(f"❌ 전체 데이터셋 S3 업로드 실패: {str(e)}")
 
     print("파이프라인 완료!") 

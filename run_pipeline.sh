@@ -47,12 +47,14 @@ show_help() {
     echo "  -p, --prefix PREFIX   S3 업로드 경로 prefix (기본값: $DEFAULT_S3_PREFIX)"
     echo "  -r, --region REGION   AWS 리전 (기본값: $DEFAULT_REGION)"
     echo "  --no-upload          S3 업로드 비활성화"
+    echo "  --clean-cache        기존 로컬 캐시 파일 정리"
     echo "  -h, --help           이 도움말 표시"
     echo ""
     echo "예시:"
     echo "  $0                                    # 기본 설정으로 실행"
     echo "  $0 -c spec14.json                     # 특정 설정 파일 사용"
     echo "  $0 --bucket my-bucket --no-upload     # S3 업로드 없이 실행"
+    echo "  $0 --clean-cache                      # 기존 캐시 정리 후 실행"
 }
 
 # 명령행 인수 파싱
@@ -61,6 +63,7 @@ S3_BUCKET="$DEFAULT_S3_BUCKET"
 S3_PREFIX="$DEFAULT_S3_PREFIX"
 REGION="$DEFAULT_REGION"
 UPLOAD_FLAG="--upload"
+CLEAN_CACHE_FLAG=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -82,6 +85,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --no-upload)
             UPLOAD_FLAG=""
+            shift
+            ;;
+        --clean-cache)
+            CLEAN_CACHE_FLAG="--clean-cache"
             shift
             ;;
         -h|--help)
@@ -209,6 +216,9 @@ main() {
     CMD="$CMD --region $REGION"
     if [[ -n "$UPLOAD_FLAG" ]]; then
         CMD="$CMD $UPLOAD_FLAG"
+    fi
+    if [[ -n "$CLEAN_CACHE_FLAG" ]]; then
+        CMD="$CMD $CLEAN_CACHE_FLAG"
     fi
     
     log_info "실행 명령어: $CMD"

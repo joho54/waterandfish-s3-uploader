@@ -4,7 +4,7 @@
 """
 
 # 데이터 처리 파라미터
-TARGET_SEQ_LENGTH = 40  # 시퀀스 길이 (프레임 수)
+TARGET_SEQ_LENGTH = 16  # 시퀀스 길이 (프레임 수)
 AUGMENTATIONS_PER_VIDEO = 3  # 비디오당 증강 데이터 수
 
 # 모델 학습 파라미터
